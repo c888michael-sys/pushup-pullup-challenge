@@ -23,6 +23,8 @@ BUTTON_END = "End"
 BUTTON_LEADERBOARD = "Leaderboard"
 BUTTON_ADMIN_PANEL = "Admin Panel"
 BUTTON_KICK_USER = "Kick User"
+BUTTON_MUTE_NOTIFICATIONS = "Mute Notifications"
+BUTTON_UNMUTE_NOTIFICATIONS = "Unmute Notifications"
 
 BUTTON_PUSHUP = "Pushup"
 BUTTON_PULLUP = "Pullup"
@@ -67,6 +69,7 @@ class Database:
                     display_name TEXT,
                     is_admin INTEGER NOT NULL DEFAULT 0,
                     is_kicked INTEGER NOT NULL DEFAULT 0,
+                    notifications_muted INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -117,6 +120,10 @@ class Database:
         if "is_kicked" not in columns:
             self.conn.execute(
                 "ALTER TABLE users ADD COLUMN is_kicked INTEGER NOT NULL DEFAULT 0"
+            )
+        if "notifications_muted" not in columns:
+            self.conn.execute(
+                "ALTER TABLE users ADD COLUMN notifications_muted INTEGER NOT NULL DEFAULT 0"
             )
 
     def ensure_user(self, chat_id: int) -> None:
@@ -222,6 +229,15 @@ class Database:
             )
             self.conn.commit()
 
+    def set_notifications_muted(self, chat_id: int, muted: bool) -> None:
+        now = sydney_now().isoformat(timespec="seconds")
+        with self.lock:
+            self.conn.execute(
+                "UPDATE users SET notifications_muted = ?, updated_at = ? WHERE chat_id = ?",
+                (1 if muted else 0, now, chat_id),
+            )
+            self.conn.commit()
+
     def get_session(self, chat_id: int) -> sqlite3.Row:
         with self.lock:
             row = self.conn.execute("SELECT * FROM sessions WHERE chat_id = ?", (chat_id,)).fetchone()
@@ -292,7 +308,7 @@ class Database:
     def get_started_users(self) -> list[int]:
         with self.lock:
             rows = self.conn.execute(
-                "SELECT chat_id FROM users WHERE started = 1 AND authenticated = 1 AND is_kicked = 0"
+                "SELECT chat_id FROM users WHERE started = 1 AND authenticated = 1 AND is_kicked = 0 AND notifications_muted = 0"
             ).fetchall()
         return [int(r["chat_id"]) for r in rows]
 
@@ -384,12 +400,13 @@ def normalize_display_name(raw: str) -> str:
     return name
 
 
-def main_menu(started: bool, is_admin: bool) -> ReplyKeyboardMarkup:
+def main_menu(started: bool, is_admin: bool, notifications_muted: bool) -> ReplyKeyboardMarkup:
     start_or_end = BUTTON_END if started else BUTTON_START
+    mute_or_unmute = BUTTON_UNMUTE_NOTIFICATIONS if notifications_muted else BUTTON_MUTE_NOTIFICATIONS
     rows = [
         [BUTTON_ADD, BUTTON_MINUS],
         [BUTTON_VIEW_PROGRESS, start_or_end],
-        [BUTTON_LEADERBOARD],
+        [BUTTON_LEADERBOARD, mute_or_unmute],
     ]
     if is_admin:
         rows.append([BUTTON_ADMIN_PANEL])
@@ -507,10 +524,15 @@ async def send_main_menu(update: Update, db: Database, text: str) -> None:
     top3_push = db.get_leaderboard_by_metric("pushups", limit=3)
     top3_pull = db.get_leaderboard_by_metric("pullups", limit=3)
     board = format_side_by_side_leaderboard(top3_push, top3_pull, "Top 3")
-    menu_text = f"{board}\n\nMain Menu\n{text}"
+    reminder_status = "Muted" if bool(user["notifications_muted"]) else "On"
+    menu_text = f"{board}\n\nMain Menu\nReminders: {reminder_status}\n{text}"
     await update.message.reply_text(
         menu_text,
-        reply_markup=main_menu(bool(user["started"]), bool(user["is_admin"])),
+        reply_markup=main_menu(
+            bool(user["started"]),
+            bool(user["is_admin"]),
+            bool(user["notifications_muted"]),
+        ),
     )
 
 
@@ -601,7 +623,11 @@ async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.message.reply_text(
         text,
-        reply_markup=main_menu(bool(user["started"]), bool(user["is_admin"])),
+        reply_markup=main_menu(
+            bool(user["started"]),
+            bool(user["is_admin"]),
+            bool(user["notifications_muted"]),
+        ),
     )
 
 
@@ -614,7 +640,11 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE, l
     text = format_side_by_side_leaderboard(push_rows, pull_rows, f"Top {limit}")
     await update.message.reply_text(
         text,
-        reply_markup=main_menu(bool(user["started"]), bool(user["is_admin"])),
+        reply_markup=main_menu(
+            bool(user["started"]),
+            bool(user["is_admin"]),
+            bool(user["notifications_muted"]),
+        ),
     )
 
 
@@ -650,7 +680,11 @@ async def process_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
     user = db.get_user(chat_id)
     await update.message.reply_text(
         f"Logged: {action_word} {amount} {exercise_word}(s) for {today_str} (Sydney time).",
-        reply_markup=main_menu(bool(user["started"]), bool(user["is_admin"])),
+        reply_markup=main_menu(
+            bool(user["started"]),
+            bool(user["is_admin"]),
+            bool(user["notifications_muted"]),
+        ),
     )
 
 
@@ -838,7 +872,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             user = db.get_user(chat_id)
             await update.message.reply_text(
                 "Challenge settings saved.",
-                reply_markup=main_menu(bool(user["started"]), bool(user["is_admin"])),
+                reply_markup=main_menu(
+                    bool(user["started"]),
+                    bool(user["is_admin"]),
+                    bool(user["notifications_muted"]),
+                ),
             )
             return
 
@@ -884,6 +922,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await show_leaderboard(update, context, limit=20)
         return
 
+    if text == BUTTON_MUTE_NOTIFICATIONS:
+        db.set_notifications_muted(chat_id, True)
+        await send_main_menu(update, db, "Notifications muted. 8 PM reminders are now off.")
+        return
+
+    if text == BUTTON_UNMUTE_NOTIFICATIONS:
+        db.set_notifications_muted(chat_id, False)
+        await send_main_menu(update, db, "Notifications unmuted. 8 PM reminders are now on.")
+        return
+
     if text == BUTTON_ADMIN_PANEL:
         if not bool(user["is_admin"]):
             await send_main_menu(update, db, "Admin access only.")
@@ -922,13 +970,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         updated_user = db.get_user(chat_id)
         await update.message.reply_text(
             f"Challenge ended on {sydney_today().isoformat()} (Sydney time).",
-            reply_markup=main_menu(bool(updated_user["started"]), bool(updated_user["is_admin"])),
+            reply_markup=main_menu(
+                bool(updated_user["started"]),
+                bool(updated_user["is_admin"]),
+                bool(updated_user["notifications_muted"]),
+            ),
         )
         return
 
     await update.message.reply_text(
         "Use the menu buttons below. You can also use /menu.",
-        reply_markup=main_menu(bool(user["started"]), bool(user["is_admin"])),
+        reply_markup=main_menu(
+            bool(user["started"]),
+            bool(user["is_admin"]),
+            bool(user["notifications_muted"]),
+        ),
     )
 
 
