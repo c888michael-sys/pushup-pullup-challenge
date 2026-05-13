@@ -15,6 +15,7 @@ SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 DB_PATH = os.getenv("DB_PATH", "pushup_pullup_bot.db")
 TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 ACCESS_PASSWORD = os.getenv("BOT_ACCESS_PASSWORD", "michael101010")
+LOG_LEVEL_ENV = "LOG_LEVEL"
 
 BUTTON_ADD = "Add"
 BUTTON_MINUS = "Minus"
@@ -997,10 +998,14 @@ def build_app() -> Application:
 
 
 def main() -> None:
+    raw_level = os.getenv(LOG_LEVEL_ENV, "WARNING").upper()
+    level = getattr(logging, raw_level, logging.WARNING)
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     application = build_app()
     application.run_polling()
