@@ -441,15 +441,23 @@ def compact_entry(rank: int, row: sqlite3.Row) -> str:
 def format_side_by_side_leaderboard(
     push_rows: list[sqlite3.Row], pull_rows: list[sqlite3.Row], limit_label: str
 ) -> str:
-    max_len = max(len(push_rows), len(pull_rows))
-    if max_len == 0:
+    if not push_rows and not pull_rows:
         return f"Leaderboard {limit_label}\nNo data yet."
 
-    lines = [f"Leaderboard {limit_label}", "Pushups | Pullups"]
-    for idx in range(max_len):
-        left = compact_entry(idx + 1, push_rows[idx]) if idx < len(push_rows) else ""
-        right = compact_entry(idx + 1, pull_rows[idx]) if idx < len(pull_rows) else ""
-        lines.append(f"{left} | {right}")
+    lines = [f"Leaderboard {limit_label}", "", "Pushups"]
+    if push_rows:
+        for idx, row in enumerate(push_rows, start=1):
+            lines.append(compact_entry(idx, row))
+    else:
+        lines.append("No pushup data.")
+
+    lines.extend(["", "Pullups"])
+    if pull_rows:
+        for idx, row in enumerate(pull_rows, start=1):
+            lines.append(compact_entry(idx, row))
+    else:
+        lines.append("No pullup data.")
+
     return "\n".join(lines)
 
 
