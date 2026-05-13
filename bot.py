@@ -11,6 +11,7 @@ from telegram.ext import Application, ApplicationBuilder, CommandHandler, Contex
 
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 DB_PATH = os.getenv("DB_PATH", "pushup_pullup_bot.db")
+USER_DB_PATH = os.getenv("USER_DB_PATH", "user_data.db")
 TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 ACCESS_PASSWORD = os.getenv("BOT_ACCESS_PASSWORD", "michael101010")
 LOG_LEVEL_ENV = "LOG_LEVEL"
@@ -49,9 +50,10 @@ STATE_ADMIN_KICK_USER = "admin_kick_user"
 
 
 class Database:
-    def __init__(self, path: str) -> None:
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+    def __init__(self, activity_path: str, user_path: str) -> None:
+        self.conn = sqlite3.connect(activity_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("ATTACH DATABASE ? AS usersdb", (user_path,))
         self.lock = threading.Lock()
         self._init_schema()
 
@@ -59,7 +61,7 @@ class Database:
         with self.lock:
             self.conn.executescript(
                 """
-                CREATE TABLE IF NOT EXISTS users (
+                CREATE TABLE IF NOT EXISTS usersdb.users (
                     chat_id INTEGER PRIMARY KEY,
                     started INTEGER NOT NULL DEFAULT 0,
                     start_date TEXT,
@@ -100,30 +102,81 @@ class Database:
                 """
             )
             self._migrate_schema()
+            self._migrate_legacy_users_if_needed()
             self.conn.commit()
 
     def _migrate_schema(self) -> None:
         columns = {
             row["name"]
-            for row in self.conn.execute("PRAGMA table_info(users)").fetchall()
+            for row in self.conn.execute("PRAGMA usersdb.table_info(users)").fetchall()
         }
         if "authenticated" not in columns:
             self.conn.execute(
-                "ALTER TABLE users ADD COLUMN authenticated INTEGER NOT NULL DEFAULT 0"
+                "ALTER TABLE usersdb.users ADD COLUMN authenticated INTEGER NOT NULL DEFAULT 0"
             )
         if "display_name" not in columns:
-            self.conn.execute("ALTER TABLE users ADD COLUMN display_name TEXT")
+            self.conn.execute("ALTER TABLE usersdb.users ADD COLUMN display_name TEXT")
         if "is_admin" not in columns:
             self.conn.execute(
-                "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"
+                "ALTER TABLE usersdb.users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"
             )
         if "is_kicked" not in columns:
             self.conn.execute(
-                "ALTER TABLE users ADD COLUMN is_kicked INTEGER NOT NULL DEFAULT 0"
+                "ALTER TABLE usersdb.users ADD COLUMN is_kicked INTEGER NOT NULL DEFAULT 0"
             )
         if "notifications_muted" not in columns:
             self.conn.execute(
-                "ALTER TABLE users ADD COLUMN notifications_muted INTEGER NOT NULL DEFAULT 0"
+                "ALTER TABLE usersdb.users ADD COLUMN notifications_muted INTEGER NOT NULL DEFAULT 0"
+            )
+
+    def _table_exists(self, schema: str, table_name: str) -> bool:
+        row = self.conn.execute(
+            f"SELECT 1 FROM {schema}.sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            (table_name,),
+        ).fetchone()
+        return row is not None
+
+    def _migrate_legacy_users_if_needed(self) -> None:
+        if not self._table_exists("main", "users"):
+            return
+
+        user_count = int(
+            self.conn.execute("SELECT COUNT(1) AS c FROM usersdb.users").fetchone()["c"]
+        )
+        if user_count > 0:
+            return
+
+        legacy_rows = self.conn.execute("SELECT * FROM main.users").fetchall()
+        if not legacy_rows:
+            return
+
+        now = sydney_now().isoformat(timespec="seconds")
+        for row in legacy_rows:
+            keys = set(row.keys())
+            self.conn.execute(
+                """
+                INSERT INTO usersdb.users(
+                    chat_id, started, start_date, end_date, goal,
+                    authenticated, display_name, is_admin, is_kicked,
+                    notifications_muted, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO NOTHING
+                """,
+                (
+                    int(row["chat_id"]),
+                    int(row["started"]) if "started" in keys and row["started"] is not None else 0,
+                    row["start_date"] if "start_date" in keys else None,
+                    row["end_date"] if "end_date" in keys else None,
+                    int(row["goal"]) if "goal" in keys and row["goal"] is not None else 0,
+                    int(row["authenticated"]) if "authenticated" in keys and row["authenticated"] is not None else 0,
+                    row["display_name"] if "display_name" in keys else None,
+                    int(row["is_admin"]) if "is_admin" in keys and row["is_admin"] is not None else 0,
+                    int(row["is_kicked"]) if "is_kicked" in keys and row["is_kicked"] is not None else 0,
+                    int(row["notifications_muted"]) if "notifications_muted" in keys and row["notifications_muted"] is not None else 0,
+                    row["created_at"] if "created_at" in keys and row["created_at"] else now,
+                    row["updated_at"] if "updated_at" in keys and row["updated_at"] else now,
+                ),
             )
 
     def ensure_user(self, chat_id: int) -> None:
@@ -131,7 +184,7 @@ class Database:
         with self.lock:
             self.conn.execute(
                 """
-                INSERT INTO users(chat_id, created_at, updated_at)
+                INSERT INTO usersdb.users(chat_id, created_at, updated_at)
                 VALUES (?, ?, ?)
                 ON CONFLICT(chat_id) DO UPDATE SET updated_at = excluded.updated_at
                 """,
@@ -149,22 +202,22 @@ class Database:
 
     def get_user(self, chat_id: int) -> sqlite3.Row:
         with self.lock:
-            row = self.conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
+            row = self.conn.execute("SELECT * FROM usersdb.users WHERE chat_id = ?", (chat_id,)).fetchone()
         if row is None:
             self.ensure_user(chat_id)
             with self.lock:
-                row = self.conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
+                row = self.conn.execute("SELECT * FROM usersdb.users WHERE chat_id = ?", (chat_id,)).fetchone()
         return row
 
     def find_user(self, chat_id: int) -> sqlite3.Row | None:
         with self.lock:
-            return self.conn.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
+            return self.conn.execute("SELECT * FROM usersdb.users WHERE chat_id = ?", (chat_id,)).fetchone()
 
     def set_started(self, chat_id: int, started: bool) -> None:
         now = sydney_now().isoformat(timespec="seconds")
         with self.lock:
             self.conn.execute(
-                "UPDATE users SET started = ?, updated_at = ? WHERE chat_id = ?",
+                "UPDATE usersdb.users SET started = ?, updated_at = ? WHERE chat_id = ?",
                 (1 if started else 0, now, chat_id),
             )
             self.conn.commit()
@@ -175,7 +228,7 @@ class Database:
         now = sydney_now().isoformat(timespec="seconds")
         with self.lock:
             self.conn.execute(
-                f"UPDATE users SET {field} = ?, updated_at = ? WHERE chat_id = ?",
+                f"UPDATE usersdb.users SET {field} = ?, updated_at = ? WHERE chat_id = ?",
                 (value, now, chat_id),
             )
             self.conn.commit()
@@ -184,7 +237,7 @@ class Database:
         now = sydney_now().isoformat(timespec="seconds")
         with self.lock:
             self.conn.execute(
-                "UPDATE users SET authenticated = ?, updated_at = ? WHERE chat_id = ?",
+                "UPDATE usersdb.users SET authenticated = ?, updated_at = ? WHERE chat_id = ?",
                 (1 if authenticated else 0, now, chat_id),
             )
             self.conn.commit()
@@ -193,7 +246,7 @@ class Database:
         now = sydney_now().isoformat(timespec="seconds")
         with self.lock:
             self.conn.execute(
-                "UPDATE users SET display_name = ?, updated_at = ? WHERE chat_id = ?",
+                "UPDATE usersdb.users SET display_name = ?, updated_at = ? WHERE chat_id = ?",
                 (display_name, now, chat_id),
             )
             self.conn.commit()
@@ -201,7 +254,7 @@ class Database:
     def has_any_admin(self) -> bool:
         with self.lock:
             row = self.conn.execute(
-                "SELECT 1 FROM users WHERE is_admin = 1 AND is_kicked = 0 LIMIT 1"
+                "SELECT 1 FROM usersdb.users WHERE is_admin = 1 AND is_kicked = 0 LIMIT 1"
             ).fetchone()
         return row is not None
 
@@ -209,7 +262,7 @@ class Database:
         now = sydney_now().isoformat(timespec="seconds")
         with self.lock:
             self.conn.execute(
-                "UPDATE users SET is_admin = ?, updated_at = ? WHERE chat_id = ?",
+                "UPDATE usersdb.users SET is_admin = ?, updated_at = ? WHERE chat_id = ?",
                 (1 if is_admin else 0, now, chat_id),
             )
             self.conn.commit()
@@ -219,7 +272,7 @@ class Database:
         with self.lock:
             self.conn.execute(
                 """
-                UPDATE users
+                UPDATE usersdb.users
                 SET is_kicked = ?, authenticated = CASE WHEN ? = 1 THEN 0 ELSE authenticated END,
                     started = CASE WHEN ? = 1 THEN 0 ELSE started END,
                     updated_at = ?
@@ -233,7 +286,7 @@ class Database:
         now = sydney_now().isoformat(timespec="seconds")
         with self.lock:
             self.conn.execute(
-                "UPDATE users SET notifications_muted = ?, updated_at = ? WHERE chat_id = ?",
+                "UPDATE usersdb.users SET notifications_muted = ?, updated_at = ? WHERE chat_id = ?",
                 (1 if muted else 0, now, chat_id),
             )
             self.conn.commit()
@@ -308,7 +361,7 @@ class Database:
     def get_started_users(self) -> list[int]:
         with self.lock:
             rows = self.conn.execute(
-                "SELECT chat_id FROM users WHERE started = 1 AND authenticated = 1 AND is_kicked = 0 AND notifications_muted = 0"
+                "SELECT chat_id FROM usersdb.users WHERE started = 1 AND authenticated = 1 AND is_kicked = 0 AND notifications_muted = 0"
             ).fetchall()
         return [int(r["chat_id"]) for r in rows]
 
@@ -327,8 +380,8 @@ class Database:
                     u.chat_id,
                     u.display_name,
                     {sum_expr} AS total
-                FROM users u
-                LEFT JOIN logs l ON l.chat_id = u.chat_id
+                FROM usersdb.users u
+                LEFT JOIN main.logs l ON l.chat_id = u.chat_id
                 WHERE u.authenticated = 1 AND u.is_kicked = 0
                 GROUP BY u.chat_id, u.display_name
                 ORDER BY total DESC, u.chat_id ASC
@@ -346,8 +399,8 @@ class Database:
                     u.chat_id,
                     u.display_name,
                     COALESCE(SUM(l.pushups + l.pullups), 0) AS total
-                FROM users u
-                LEFT JOIN logs l ON l.chat_id = u.chat_id
+                FROM usersdb.users u
+                LEFT JOIN main.logs l ON l.chat_id = u.chat_id
                 WHERE u.authenticated = 1 AND u.is_kicked = 0
                 GROUP BY u.chat_id, u.display_name
                 ORDER BY total DESC, u.chat_id ASC
@@ -1036,7 +1089,7 @@ def build_app() -> Application:
     if not token:
         raise RuntimeError(f"Missing {TOKEN_ENV} environment variable")
 
-    db = Database(DB_PATH)
+    db = Database(DB_PATH, USER_DB_PATH)
 
     app = ApplicationBuilder().token(token).post_init(on_startup).post_shutdown(on_shutdown).build()
     app.bot_data["db"] = db

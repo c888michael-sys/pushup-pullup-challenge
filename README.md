@@ -5,8 +5,8 @@ A lightweight Telegram bot for tracking pushup/pullup challenges with:
 - Add/Minus logging (including 0)
 - Challenge start/end + start date/end date/goal settings
 - Progress stats (total, average/day, 7-day trend)
-- Main-menu leaderboard (Top 3) with separate Pushup/Pullup columns
-- Compact Top 20 view with separate Pushup/Pullup columns
+- Main-menu leaderboard (Top 3) with separate Pushup/Pullup sections
+- Compact Top 20 view with separate Pushup/Pullup sections
 - 8:00 PM Sydney reminder when nothing is logged that day
 - First-time password gate + one-time display name capture
 - Admin support (first authenticated user becomes admin, can kick users)
@@ -17,7 +17,8 @@ This bot uses Python + SQLite (`sqlite3`) for a small footprint and simple deplo
 ## Files
 - `bot.py` - main bot app
 - `requirements.txt` - dependencies
-- `pushup_pullup_bot.db` - SQLite DB (auto-created at runtime)
+- `pushup_pullup_bot.db` - workout/activity DB (logs, sessions, reminder history)
+- `user_data.db` - user profile DB (auth, names, admin, kick/mute state)
 
 ## Setup
 1. Create a virtual env (optional but recommended):
@@ -36,6 +37,7 @@ pip install -r requirements.txt
 $env:TELEGRAM_BOT_TOKEN="YOUR_BOT_TOKEN"
 $env:BOT_ACCESS_PASSWORD="michael101010"
 $env:DB_PATH="pushup_pullup_bot.db"
+$env:USER_DB_PATH="user_data.db"
 ```
 
 4. Run:
@@ -48,13 +50,13 @@ python bot.py
 - After successful password entry, user is asked once for a display name.
 - After name is set, user is not asked for password/name again.
 - The first authenticated user becomes admin automatically.
-- Main menu message always shows `Top 3` with Pushup/Pullup side-by-side, then menu buttons.
+- Main menu message always shows `Top 3` with separate Pushup then Pullup sections, then menu buttons.
 - Main menu buttons:
   - `Add`
   - `Minus`
   - `View Progress`
   - `Start` or `End` (dynamic)
-  - `Leaderboard` (shows compact top 20 with Pushup/Pullup side-by-side)
+  - `Leaderboard` (shows compact top 20 with separate Pushup/Pullup sections)
   - `Admin Panel` (admin only)
 - After `Start`, bot shows config menu:
   - `Start Date`
@@ -87,6 +89,7 @@ WorkingDirectory=/path/to/bots
 Environment="TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN"
 Environment="BOT_ACCESS_PASSWORD=michael101010"
 Environment="DB_PATH=/path/to/bots/pushup_pullup_bot.db"
+Environment="USER_DB_PATH=/path/to/bots/user_data.db"
 ExecStart=/path/to/bots/.venv/bin/python /path/to/bots/bot.py
 Restart=always
 RestartSec=5
