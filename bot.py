@@ -1,5 +1,4 @@
 import asyncio
-import html
 import logging
 import os
 import sqlite3
@@ -8,7 +7,6 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram import ReplyKeyboardMarkup, Update
-from telegram.constants import ParseMode
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
@@ -437,7 +435,7 @@ def compact_entry(rank: int, row: sqlite3.Row) -> str:
         safe_name = f"User{int(row['chat_id'])}"
     if len(safe_name) > 12:
         safe_name = safe_name[:12]
-    return f"{rank:>2}. {safe_name:<12} {int(row['total']):>5}"
+    return f"{rank}. {safe_name} {int(row['total'])}"
 
 
 def format_side_by_side_leaderboard(
@@ -445,22 +443,14 @@ def format_side_by_side_leaderboard(
 ) -> str:
     max_len = max(len(push_rows), len(pull_rows))
     if max_len == 0:
-        return f"<b>Leaderboard {html.escape(limit_label)}</b>\n<pre>No data yet.</pre>"
+        return f"Leaderboard {limit_label}\nNo data yet."
 
-    left_title = "PUSHUPS"
-    right_title = "PULLUPS"
-    col_width = 24
-    lines = [
-        f"{left_title:<{col_width}}{right_title}",
-        f"{'-' * (col_width - 1)} {'-' * (col_width - 1)}",
-    ]
+    lines = [f"Leaderboard {limit_label}", "Pushups | Pullups"]
     for idx in range(max_len):
         left = compact_entry(idx + 1, push_rows[idx]) if idx < len(push_rows) else ""
         right = compact_entry(idx + 1, pull_rows[idx]) if idx < len(pull_rows) else ""
-        lines.append(f"{left:<{col_width}}{right}")
-
-    block = html.escape("\n".join(lines))
-    return f"<b>Leaderboard {html.escape(limit_label)}</b>\n<pre>{block}</pre>"
+        lines.append(f"{left} | {right}")
+    return "\n".join(lines)
 
 
 def trend_text(recent: int, previous: int) -> str:
@@ -509,10 +499,9 @@ async def send_main_menu(update: Update, db: Database, text: str) -> None:
     top3_push = db.get_leaderboard_by_metric("pushups", limit=3)
     top3_pull = db.get_leaderboard_by_metric("pullups", limit=3)
     board = format_side_by_side_leaderboard(top3_push, top3_pull, "Top 3")
-    menu_text = f"{board}\n<b>Main Menu</b>\n{html.escape(text)}"
+    menu_text = f"{board}\n\nMain Menu\n{text}"
     await update.message.reply_text(
         menu_text,
-        parse_mode=ParseMode.HTML,
         reply_markup=main_menu(bool(user["started"]), bool(user["is_admin"])),
     )
 
@@ -592,20 +581,18 @@ async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     goal = int(user["goal"] or 0)
     goal_line = "Goal: not set" if goal == 0 else f"Goal: {goal}"
 
-    lines = [
-        f"Total progress : {total}",
-        f"Pushups / Pullups : {pushups} / {pullups}",
-        f"Average/day : {avg_text}",
-        f"Trend (7d vs prev 7d) : {trend}",
-        f"Recent 7d / Previous 7d : {recent_total} / {previous_total}",
-        goal_line,
-    ]
-    escaped_block = html.escape("\n".join(lines))
-    text = f"<b>Progress Summary</b>\n<pre>{escaped_block}</pre>"
+    text = (
+        "Progress Summary\n"
+        f"Total progress: {total}\n"
+        f"Pushups / Pullups: {pushups} / {pullups}\n"
+        f"Average/day: {avg_text}\n"
+        f"Trend (7d vs prev 7d): {trend}\n"
+        f"Recent 7d / Previous 7d: {recent_total} / {previous_total}\n"
+        f"{goal_line}"
+    )
 
     await update.message.reply_text(
         text,
-        parse_mode=ParseMode.HTML,
         reply_markup=main_menu(bool(user["started"]), bool(user["is_admin"])),
     )
 
@@ -619,7 +606,6 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE, l
     text = format_side_by_side_leaderboard(push_rows, pull_rows, f"Top {limit}")
     await update.message.reply_text(
         text,
-        parse_mode=ParseMode.HTML,
         reply_markup=main_menu(bool(user["started"]), bool(user["is_admin"])),
     )
 
