@@ -493,7 +493,7 @@ def config_menu() -> ReplyKeyboardMarkup:
 
 def admin_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[BUTTON_KICK_USER, BUTTON_SEND_MESSAGE], [BUTTON_BACK]],
+        [[BUTTON_KICK_USER], [BUTTON_SEND_MESSAGE], [BUTTON_BACK]],
         resize_keyboard=True,
         is_persistent=True,
     )
