@@ -24,6 +24,7 @@ BUTTON_END = "End"
 BUTTON_LEADERBOARD = "Leaderboard"
 BUTTON_ADMIN_PANEL = "Admin Panel"
 BUTTON_KICK_USER = "Kick User"
+BUTTON_SEND_MESSAGE = "Send Message"
 BUTTON_MUTE_NOTIFICATIONS = "Mute Notifications"
 BUTTON_UNMUTE_NOTIFICATIONS = "Unmute Notifications"
 
@@ -47,6 +48,7 @@ STATE_WAIT_PASSWORD = "wait_password"
 STATE_WAIT_NAME = "wait_name"
 STATE_ADMIN_MENU = "admin_menu"
 STATE_ADMIN_KICK_USER = "admin_kick_user"
+STATE_ADMIN_SEND_MESSAGE = "admin_send_message"
 
 
 class Database:
@@ -491,7 +493,7 @@ def config_menu() -> ReplyKeyboardMarkup:
 
 def admin_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[BUTTON_KICK_USER], [BUTTON_BACK]],
+        [[BUTTON_KICK_USER, BUTTON_SEND_MESSAGE], [BUTTON_BACK]],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -648,6 +650,36 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await send_main_menu(update, db, "Main menu:")
 
 
+async def send_admin_message(
+    app: Application, db: Database, target_arg: str, message_text: str
+) -> str:
+    if target_arg == "all":
+        targets = db.get_active_user_ids()
+        sent = 0
+        failed = 0
+        for target_chat_id in targets:
+            try:
+                await app.bot.send_message(chat_id=target_chat_id, text=message_text)
+                sent += 1
+            except Exception:
+                failed += 1
+                logging.exception("Failed admin broadcast to chat_id=%s", target_chat_id)
+        return f"Broadcast done. Sent: {sent}, Failed: {failed}."
+
+    try:
+        target_chat_id = int(target_arg)
+    except ValueError as exc:
+        raise ValueError("Target must be a numeric chat ID or 'all'.") from exc
+
+    try:
+        await app.bot.send_message(chat_id=target_chat_id, text=message_text)
+    except Exception as exc:
+        logging.exception("Failed admin direct message to chat_id=%s", target_chat_id)
+        raise RuntimeError(f"Failed to send message to {target_chat_id}.") from exc
+
+    return f"Message sent to {target_chat_id}."
+
+
 async def admin_message_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or update.effective_chat is None:
         return
@@ -673,35 +705,11 @@ async def admin_message_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Message text cannot be empty.")
         return
 
-    if target_arg == "all":
-        targets = db.get_active_user_ids()
-        sent = 0
-        failed = 0
-        for target_chat_id in targets:
-            try:
-                await context.application.bot.send_message(chat_id=target_chat_id, text=message_text)
-                sent += 1
-            except Exception:
-                failed += 1
-                logging.exception("Failed admin broadcast to chat_id=%s", target_chat_id)
-
-        await update.message.reply_text(f"Broadcast done. Sent: {sent}, Failed: {failed}.")
-        return
-
     try:
-        target_chat_id = int(target_arg)
-    except ValueError:
-        await update.message.reply_text("Target must be a numeric chat ID or 'all'.")
-        return
-
-    try:
-        await context.application.bot.send_message(chat_id=target_chat_id, text=message_text)
-    except Exception:
-        logging.exception("Failed admin direct message to chat_id=%s", target_chat_id)
-        await update.message.reply_text(f"Failed to send message to {target_chat_id}.")
-        return
-
-    await update.message.reply_text(f"Message sent to {target_chat_id}.")
+        result = await send_admin_message(context.application, db, target_arg, message_text)
+        await update.message.reply_text(result)
+    except (ValueError, RuntimeError) as exc:
+        await update.message.reply_text(str(exc))
 
 
 async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -902,6 +910,39 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await send_main_menu(update, db, f"Name saved as {display_name}.{extra}")
         return
 
+    if state == STATE_ADMIN_SEND_MESSAGE:
+        if text == BUTTON_BACK:
+            db.set_session(chat_id, STATE_ADMIN_MENU)
+            await update.message.reply_text("Back to admin menu.", reply_markup=admin_menu())
+            return
+
+        payload = text.strip()
+        if ":" in payload:
+            target_arg, message_text = payload.split(":", 1)
+        else:
+            parts = payload.split(maxsplit=1)
+            if len(parts) < 2:
+                await update.message.reply_text(
+                    "Format: all: your message OR <chat_id>: your message",
+                    reply_markup=admin_menu(),
+                )
+                return
+            target_arg, message_text = parts[0], parts[1]
+
+        target_arg = target_arg.strip().lower()
+        message_text = message_text.strip()
+        if not message_text:
+            await update.message.reply_text("Message text cannot be empty.", reply_markup=admin_menu())
+            return
+
+        try:
+            result = await send_admin_message(context.application, db, target_arg, message_text)
+            db.set_session(chat_id, STATE_ADMIN_MENU)
+            await update.message.reply_text(result, reply_markup=admin_menu())
+        except (ValueError, RuntimeError) as exc:
+            await update.message.reply_text(str(exc), reply_markup=admin_menu())
+        return
+
     if state == STATE_ADMIN_KICK_USER:
         if text == BUTTON_BACK:
             db.set_session(chat_id, STATE_NONE)
@@ -948,7 +989,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=admin_menu(),
             )
             return
-        await update.message.reply_text("Choose Kick User or Back.", reply_markup=admin_menu())
+        if text == BUTTON_SEND_MESSAGE:
+            db.set_session(chat_id, STATE_ADMIN_SEND_MESSAGE)
+            await update.message.reply_text(
+                "Send message in this format:\nall: your message\nor\n<chat_id>: your message",
+                reply_markup=admin_menu(),
+            )
+            return
+        await update.message.reply_text("Choose Kick User, Send Message, or Back.", reply_markup=admin_menu())
         return
 
     if state == STATE_ENTER_AMOUNT:

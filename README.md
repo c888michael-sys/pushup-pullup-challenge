@@ -71,6 +71,7 @@ python bot.py
   - Around 8:00 PM, if no logs exist for that day, sends reminder.
 - Admin panel:
   - `Kick User`
+  - `Send Message` (format: `all: your message` or `<chat_id>: your message`)
   - Admin can kick non-admin users by chat ID
   - Kicked users lose access
 - Admin command:
