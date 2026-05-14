@@ -73,6 +73,9 @@ python bot.py
   - `Kick User`
   - Admin can kick non-admin users by chat ID
   - Kicked users lose access
+- Admin command:
+  - `/adminmsg <chat_id|all> <message>`
+  - Example: `/adminmsg all Workout reminder: log your reps today.`
 
 ## Deploy on Google Cloud VM
 Use your existing bot host process manager. Example with systemd:

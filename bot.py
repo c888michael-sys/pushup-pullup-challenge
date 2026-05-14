@@ -365,6 +365,13 @@ class Database:
             ).fetchall()
         return [int(r["chat_id"]) for r in rows]
 
+    def get_active_user_ids(self) -> list[int]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT chat_id FROM usersdb.users WHERE authenticated = 1 AND is_kicked = 0"
+            ).fetchall()
+        return [int(r["chat_id"]) for r in rows]
+
     def get_leaderboard_by_metric(self, metric: str, limit: int = 20) -> list[sqlite3.Row]:
         if metric == "pushups":
             sum_expr = "COALESCE(SUM(l.pushups), 0)"
@@ -639,6 +646,62 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await send_main_menu(update, db, "Main menu:")
+
+
+async def admin_message_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.effective_chat is None:
+        return
+
+    db: Database = context.application.bot_data["db"]
+    sender_chat_id = update.effective_chat.id
+    db.ensure_user(sender_chat_id)
+    sender = db.get_user(sender_chat_id)
+
+    if bool(sender["is_kicked"]) or not bool(sender["authenticated"]) or not bool(sender["is_admin"]):
+        await update.message.reply_text("Admin access only.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /adminmsg <chat_id|all> <message>\nExample: /adminmsg all Reminder: workout today."
+        )
+        return
+
+    target_arg = context.args[0].strip().lower()
+    message_text = " ".join(context.args[1:]).strip()
+    if not message_text:
+        await update.message.reply_text("Message text cannot be empty.")
+        return
+
+    if target_arg == "all":
+        targets = db.get_active_user_ids()
+        sent = 0
+        failed = 0
+        for target_chat_id in targets:
+            try:
+                await context.application.bot.send_message(chat_id=target_chat_id, text=message_text)
+                sent += 1
+            except Exception:
+                failed += 1
+                logging.exception("Failed admin broadcast to chat_id=%s", target_chat_id)
+
+        await update.message.reply_text(f"Broadcast done. Sent: {sent}, Failed: {failed}.")
+        return
+
+    try:
+        target_chat_id = int(target_arg)
+    except ValueError:
+        await update.message.reply_text("Target must be a numeric chat ID or 'all'.")
+        return
+
+    try:
+        await context.application.bot.send_message(chat_id=target_chat_id, text=message_text)
+    except Exception:
+        logging.exception("Failed admin direct message to chat_id=%s", target_chat_id)
+        await update.message.reply_text(f"Failed to send message to {target_chat_id}.")
+        return
+
+    await update.message.reply_text(f"Message sent to {target_chat_id}.")
 
 
 async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1096,6 +1159,7 @@ def build_app() -> Application:
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("menu", menu_command))
+    app.add_handler(CommandHandler("adminmsg", admin_message_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return app
 
