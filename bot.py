@@ -24,7 +24,7 @@ BUTTON_END = "End"
 BUTTON_LEADERBOARD = "Leaderboard"
 BUTTON_ADMIN_PANEL = "Admin Panel"
 BUTTON_KICK_USER = "Kick User"
-BUTTON_SEND_MESSAGE = "Send Message"
+BUTTON_GLOBAL_MESSAGE = "Global Message"
 BUTTON_MUTE_NOTIFICATIONS = "Mute Notifications"
 BUTTON_UNMUTE_NOTIFICATIONS = "Unmute Notifications"
 
@@ -493,7 +493,7 @@ def config_menu() -> ReplyKeyboardMarkup:
 
 def admin_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[BUTTON_KICK_USER], [BUTTON_SEND_MESSAGE], [BUTTON_BACK]],
+        [[BUTTON_KICK_USER], [BUTTON_GLOBAL_MESSAGE], [BUTTON_BACK]],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -916,27 +916,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("Back to admin menu.", reply_markup=admin_menu())
             return
 
-        payload = text.strip()
-        if ":" in payload:
-            target_arg, message_text = payload.split(":", 1)
-        else:
-            parts = payload.split(maxsplit=1)
-            if len(parts) < 2:
-                await update.message.reply_text(
-                    "Format: all: your message OR <chat_id>: your message",
-                    reply_markup=admin_menu(),
-                )
-                return
-            target_arg, message_text = parts[0], parts[1]
-
-        target_arg = target_arg.strip().lower()
-        message_text = message_text.strip()
+        message_text = text.strip()
         if not message_text:
             await update.message.reply_text("Message text cannot be empty.", reply_markup=admin_menu())
             return
 
         try:
-            result = await send_admin_message(context.application, db, target_arg, message_text)
+            result = await send_admin_message(context.application, db, "all", message_text)
             db.set_session(chat_id, STATE_ADMIN_MENU)
             await update.message.reply_text(result, reply_markup=admin_menu())
         except (ValueError, RuntimeError) as exc:
@@ -989,14 +975,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=admin_menu(),
             )
             return
-        if text == BUTTON_SEND_MESSAGE:
+        if text == BUTTON_GLOBAL_MESSAGE:
             db.set_session(chat_id, STATE_ADMIN_SEND_MESSAGE)
             await update.message.reply_text(
-                "Send message in this format:\nall: your message\nor\n<chat_id>: your message",
+                "Send the message to broadcast to all users.",
                 reply_markup=admin_menu(),
             )
             return
-        await update.message.reply_text("Choose Kick User, Send Message, or Back.", reply_markup=admin_menu())
+        await update.message.reply_text("Choose Kick User, Global Message, or Back.", reply_markup=admin_menu())
         return
 
     if state == STATE_ENTER_AMOUNT:
