@@ -5,6 +5,7 @@ A lightweight Telegram bot for tracking pushup/pullup challenges with:
 - Add/Minus logging (including 0)
 - Challenge start/end + start date/end date/goal settings
 - Progress stats (total, average/day, 7-day trend)
+- Progress graph in `View Progress` (daily totals + best-fit line)
 - Main-menu leaderboard (Top 3) with separate Pushup/Pullup sections
 - Compact Top 20 view with separate Pushup/Pullup sections
 - 8:00 PM Sydney reminder when nothing is logged that day
@@ -119,3 +120,4 @@ sudo systemctl status pushup-bot
 - Date format for challenge dates is `YYYY-MM-DD`.
 - Trend compares recent 7 days to the previous 7 days.
 - If previous 7-day total is 0 and recent is >0, trend shows as increasing/new activity.
+- `View Progress` includes an ASCII daily graph and best-fit slope direction.

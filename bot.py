@@ -421,6 +421,21 @@ class Database:
             ).fetchone()
         return int(row["total"])
 
+    def get_daily_totals(self, chat_id: int, limit_days: int = 14) -> list[sqlite3.Row]:
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT log_date, COALESCE(SUM(pushups + pullups), 0) AS total
+                FROM logs
+                WHERE chat_id = ?
+                GROUP BY log_date
+                ORDER BY log_date DESC
+                LIMIT ?
+                """,
+                (chat_id, limit_days),
+            ).fetchall()
+        return list(reversed(rows))
+
     def has_log_for_day(self, chat_id: int, log_date: str) -> bool:
         with self.lock:
             row = self.conn.execute(
@@ -634,6 +649,56 @@ def trend_text(recent: int, previous: int) -> str:
     return f"{direction} ({ratio:.1f}%)"
 
 
+def build_daily_trend_graph(daily_rows: list[sqlite3.Row]) -> tuple[str, float]:
+    if not daily_rows:
+        return "Daily trend graph: no workout logs yet.", 0.0
+
+    if len(daily_rows) == 1:
+        only = daily_rows[0]
+        return f"Daily trend graph: need at least 2 days.\n{only['log_date']}: {int(only['total'])}", 0.0
+
+    y_values = [float(int(r["total"])) for r in daily_rows]
+    n = len(y_values)
+    x_values = [float(i) for i in range(n)]
+
+    x_mean = sum(x_values) / n
+    y_mean = sum(y_values) / n
+    denom = sum((x - x_mean) ** 2 for x in x_values)
+    slope = (sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, y_values)) / denom) if denom else 0.0
+    intercept = y_mean - slope * x_mean
+    fit_values = [slope * x + intercept for x in x_values]
+
+    y_min = min(min(y_values), min(fit_values), 0.0)
+    y_max = max(max(y_values), max(fit_values), 1.0)
+    if abs(y_max - y_min) < 1e-9:
+        y_max += 1.0
+
+    height = 8
+    width = n
+    grid = [[" " for _ in range(width)] for _ in range(height)]
+
+    def to_row(v: float) -> int:
+        ratio = (v - y_min) / (y_max - y_min)
+        row = height - 1 - int(round(ratio * (height - 1)))
+        return max(0, min(height - 1, row))
+
+    for i, fv in enumerate(fit_values):
+        r = to_row(fv)
+        grid[r][i] = "-"
+
+    for i, yv in enumerate(y_values):
+        r = to_row(yv)
+        grid[r][i] = "x" if grid[r][i] == "-" else "*"
+
+    lines = ["Daily trend graph (latest days)", "Legend: * daily total, - best-fit, x overlap"]
+    for ridx, row in enumerate(grid):
+        y_label = y_max - (y_max - y_min) * (ridx / (height - 1))
+        lines.append(f"{int(round(y_label)):>4}|{''.join(row)}")
+    lines.append("    +" + "-" * width)
+    lines.append(f"     {daily_rows[0]['log_date']} -> {daily_rows[-1]['log_date']}")
+    return "\n".join(lines), slope
+
+
 def compute_average(total: int, user_row: sqlite3.Row) -> str:
     start_raw = user_row["start_date"]
     if not start_raw:
@@ -821,9 +886,18 @@ async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     previous_total = db.get_total_in_date_range(chat_id, previous_start, previous_end)
 
     trend = trend_text(recent_total, previous_total)
+    daily_rows = db.get_daily_totals(chat_id, limit_days=14)
+    graph_text, slope = build_daily_trend_graph(daily_rows)
 
     goal = int(user["goal"] or 0)
-    goal_line = "Goal: not set" if goal == 0 else f"Goal: {goal}"
+    if goal == 0:
+        goal_line = "Goal: not set"
+    else:
+        goal_pct = (total / goal) * 100 if goal > 0 else 0.0
+        remaining = goal - total
+        goal_line = f"Goal: {goal} | Progress: {goal_pct:.1f}% | Remaining: {remaining}"
+
+    slope_label = "upward" if slope > 0 else ("downward" if slope < 0 else "flat")
 
     text = (
         "Progress Summary\n"
@@ -831,8 +905,10 @@ async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Pushups / Pullups: {pushups} / {pullups}\n"
         f"Average/day: {avg_text}\n"
         f"Trend (7d vs prev 7d): {trend}\n"
+        f"Best-fit line slope: {slope:.2f} ({slope_label})\n"
         f"Recent 7d / Previous 7d: {recent_total} / {previous_total}\n"
-        f"{goal_line}"
+        f"{goal_line}\n\n"
+        f"{graph_text}"
     )
 
     await update.message.reply_text(
@@ -958,7 +1034,9 @@ async def process_goal_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     db.update_user_field(chat_id, "goal", goal)
     db.set_session(chat_id, STATE_CONFIG_MENU)
-    await update.message.reply_text(f"Goal saved: {goal}", reply_markup=config_menu())
+    refreshed = db.get_user(chat_id)
+    current_goal = int(refreshed["goal"] or 0)
+    await update.message.reply_text(f"Goal saved: {current_goal}", reply_markup=config_menu())
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
