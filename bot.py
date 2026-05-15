@@ -21,10 +21,11 @@ BUTTON_MINUS = "Minus"
 BUTTON_VIEW_PROGRESS = "View Progress"
 BUTTON_START = "Start"
 BUTTON_END = "End"
+BUTTON_START_TRAINING = "Start Training"
+BUTTON_STOP_TRAINING = "Stop Training"
 BUTTON_LEADERBOARD = "Leaderboard"
 BUTTON_ADMIN_PANEL = "Admin Panel"
 BUTTON_KICK_USER = "Kick User"
-BUTTON_GLOBAL_MESSAGE = "Global Message"
 BUTTON_MUTE_NOTIFICATIONS = "Mute Notifications"
 BUTTON_UNMUTE_NOTIFICATIONS = "Unmute Notifications"
 
@@ -48,7 +49,7 @@ STATE_WAIT_PASSWORD = "wait_password"
 STATE_WAIT_NAME = "wait_name"
 STATE_ADMIN_MENU = "admin_menu"
 STATE_ADMIN_KICK_USER = "admin_kick_user"
-STATE_ADMIN_SEND_MESSAGE = "admin_send_message"
+STATE_SET_TRAINING_INTERVAL = "set_training_interval"
 
 
 class Database:
@@ -74,6 +75,9 @@ class Database:
                     is_admin INTEGER NOT NULL DEFAULT 0,
                     is_kicked INTEGER NOT NULL DEFAULT 0,
                     notifications_muted INTEGER NOT NULL DEFAULT 0,
+                    training_active INTEGER NOT NULL DEFAULT 0,
+                    training_interval_minutes INTEGER NOT NULL DEFAULT 0,
+                    training_last_sent_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -130,6 +134,18 @@ class Database:
             self.conn.execute(
                 "ALTER TABLE usersdb.users ADD COLUMN notifications_muted INTEGER NOT NULL DEFAULT 0"
             )
+        if "training_active" not in columns:
+            self.conn.execute(
+                "ALTER TABLE usersdb.users ADD COLUMN training_active INTEGER NOT NULL DEFAULT 0"
+            )
+        if "training_interval_minutes" not in columns:
+            self.conn.execute(
+                "ALTER TABLE usersdb.users ADD COLUMN training_interval_minutes INTEGER NOT NULL DEFAULT 0"
+            )
+        if "training_last_sent_at" not in columns:
+            self.conn.execute(
+                "ALTER TABLE usersdb.users ADD COLUMN training_last_sent_at TEXT"
+            )
 
     def _table_exists(self, schema: str, table_name: str) -> bool:
         row = self.conn.execute(
@@ -160,9 +176,10 @@ class Database:
                 INSERT INTO usersdb.users(
                     chat_id, started, start_date, end_date, goal,
                     authenticated, display_name, is_admin, is_kicked,
-                    notifications_muted, created_at, updated_at
+                    notifications_muted, training_active, training_interval_minutes,
+                    training_last_sent_at, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id) DO NOTHING
                 """,
                 (
@@ -176,6 +193,9 @@ class Database:
                     int(row["is_admin"]) if "is_admin" in keys and row["is_admin"] is not None else 0,
                     int(row["is_kicked"]) if "is_kicked" in keys and row["is_kicked"] is not None else 0,
                     int(row["notifications_muted"]) if "notifications_muted" in keys and row["notifications_muted"] is not None else 0,
+                    int(row["training_active"]) if "training_active" in keys and row["training_active"] is not None else 0,
+                    int(row["training_interval_minutes"]) if "training_interval_minutes" in keys and row["training_interval_minutes"] is not None else 0,
+                    row["training_last_sent_at"] if "training_last_sent_at" in keys else None,
                     row["created_at"] if "created_at" in keys and row["created_at"] else now,
                     row["updated_at"] if "updated_at" in keys and row["updated_at"] else now,
                 ),
@@ -292,6 +312,55 @@ class Database:
                 (1 if muted else 0, now, chat_id),
             )
             self.conn.commit()
+
+    def start_training(self, chat_id: int, interval_minutes: int) -> None:
+        now = sydney_now().isoformat(timespec="seconds")
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE usersdb.users
+                SET training_active = 1, training_interval_minutes = ?, training_last_sent_at = ?, updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (interval_minutes, now, now, chat_id),
+            )
+            self.conn.commit()
+
+    def stop_training(self, chat_id: int) -> None:
+        now = sydney_now().isoformat(timespec="seconds")
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE usersdb.users
+                SET training_active = 0, training_last_sent_at = NULL, updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (now, chat_id),
+            )
+            self.conn.commit()
+
+    def update_training_last_sent(self, chat_id: int, sent_at_iso: str) -> None:
+        now = sydney_now().isoformat(timespec="seconds")
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE usersdb.users
+                SET training_last_sent_at = ?, updated_at = ?
+                WHERE chat_id = ?
+                """,
+                (sent_at_iso, now, chat_id),
+            )
+            self.conn.commit()
+
+    def get_training_users(self) -> list[sqlite3.Row]:
+        with self.lock:
+            return self.conn.execute(
+                """
+                SELECT chat_id, training_interval_minutes, training_last_sent_at
+                FROM usersdb.users
+                WHERE training_active = 1 AND authenticated = 1 AND is_kicked = 0
+                """
+            ).fetchall()
 
     def get_session(self, chat_id: int) -> sqlite3.Row:
         with self.lock:
@@ -455,6 +524,13 @@ def parse_iso_date(raw: str) -> date | None:
         return None
 
 
+def parse_iso_datetime(raw: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
 def normalize_display_name(raw: str) -> str:
     name = " ".join(raw.strip().split())
     if len(name) > 24:
@@ -462,12 +538,14 @@ def normalize_display_name(raw: str) -> str:
     return name
 
 
-def main_menu(started: bool, is_admin: bool, notifications_muted: bool) -> ReplyKeyboardMarkup:
+def main_menu(started: bool, is_admin: bool, notifications_muted: bool, training_active: bool) -> ReplyKeyboardMarkup:
     start_or_end = BUTTON_END if started else BUTTON_START
     mute_or_unmute = BUTTON_UNMUTE_NOTIFICATIONS if notifications_muted else BUTTON_MUTE_NOTIFICATIONS
+    training_button = BUTTON_STOP_TRAINING if training_active else BUTTON_START_TRAINING
     rows = [
         [BUTTON_ADD, BUTTON_MINUS],
         [BUTTON_VIEW_PROGRESS, start_or_end],
+        [training_button],
         [BUTTON_LEADERBOARD, mute_or_unmute],
     ]
     if is_admin:
@@ -493,7 +571,7 @@ def config_menu() -> ReplyKeyboardMarkup:
 
 def admin_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[BUTTON_KICK_USER], [BUTTON_GLOBAL_MESSAGE], [BUTTON_BACK]],
+        [[BUTTON_KICK_USER], [BUTTON_BACK]],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -587,13 +665,19 @@ async def send_main_menu(update: Update, db: Database, text: str) -> None:
     top3_pull = db.get_leaderboard_by_metric("pullups", limit=3)
     board = format_side_by_side_leaderboard(top3_push, top3_pull, "Top 3")
     reminder_status = "Muted" if bool(user["notifications_muted"]) else "On"
-    menu_text = f"{board}\n\nMain Menu\nReminders: {reminder_status}\n{text}"
+    if bool(user["training_active"]):
+        interval = int(user["training_interval_minutes"] or 0)
+        training_status = f"On ({interval} min)" if interval > 0 else "On"
+    else:
+        training_status = "Off"
+    menu_text = f"{board}\n\nMain Menu\nReminders: {reminder_status}\nTraining: {training_status}\n{text}"
     await update.message.reply_text(
         menu_text,
         reply_markup=main_menu(
             bool(user["started"]),
             bool(user["is_admin"]),
             bool(user["notifications_muted"]),
+            bool(user["training_active"]),
         ),
     )
 
@@ -751,6 +835,7 @@ async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             bool(user["started"]),
             bool(user["is_admin"]),
             bool(user["notifications_muted"]),
+            bool(user["training_active"]),
         ),
     )
 
@@ -768,6 +853,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE, l
             bool(user["started"]),
             bool(user["is_admin"]),
             bool(user["notifications_muted"]),
+            bool(user["training_active"]),
         ),
     )
 
@@ -808,6 +894,7 @@ async def process_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
             bool(user["started"]),
             bool(user["is_admin"]),
             bool(user["notifications_muted"]),
+            bool(user["training_active"]),
         ),
     )
 
@@ -910,25 +997,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await send_main_menu(update, db, f"Name saved as {display_name}.{extra}")
         return
 
-    if state == STATE_ADMIN_SEND_MESSAGE:
-        if text == BUTTON_BACK:
-            db.set_session(chat_id, STATE_ADMIN_MENU)
-            await update.message.reply_text("Back to admin menu.", reply_markup=admin_menu())
-            return
-
-        message_text = text.strip()
-        if not message_text:
-            await update.message.reply_text("Message text cannot be empty.", reply_markup=admin_menu())
-            return
-
-        try:
-            result = await send_admin_message(context.application, db, "all", message_text)
-            db.set_session(chat_id, STATE_ADMIN_MENU)
-            await update.message.reply_text(result, reply_markup=admin_menu())
-        except (ValueError, RuntimeError) as exc:
-            await update.message.reply_text(str(exc), reply_markup=admin_menu())
-        return
-
     if state == STATE_ADMIN_KICK_USER:
         if text == BUTTON_BACK:
             db.set_session(chat_id, STATE_NONE)
@@ -975,14 +1043,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=admin_menu(),
             )
             return
-        if text == BUTTON_GLOBAL_MESSAGE:
-            db.set_session(chat_id, STATE_ADMIN_SEND_MESSAGE)
-            await update.message.reply_text(
-                "Send the message to broadcast to all users.",
-                reply_markup=admin_menu(),
-            )
-            return
-        await update.message.reply_text("Choose Kick User, Global Message, or Back.", reply_markup=admin_menu())
+        await update.message.reply_text("Choose Kick User or Back.", reply_markup=admin_menu())
         return
 
     if state == STATE_ENTER_AMOUNT:
@@ -995,6 +1056,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if state == STATE_SET_GOAL:
         await process_goal_input(update, context)
+        return
+
+    if state == STATE_SET_TRAINING_INTERVAL:
+        if text == BUTTON_BACK:
+            db.set_session(chat_id, STATE_NONE)
+            await send_main_menu(update, db, "Training setup cancelled.")
+            return
+
+        try:
+            interval_minutes = int(text)
+        except ValueError:
+            await update.message.reply_text("Send interval in whole minutes (for example: 30).")
+            return
+
+        if interval_minutes <= 0:
+            await update.message.reply_text("Interval must be at least 1 minute.")
+            return
+
+        db.start_training(chat_id, interval_minutes)
+        db.set_session(chat_id, STATE_NONE)
+        await send_main_menu(update, db, f"Training started. You will get reminders every {interval_minutes} minute(s).")
         return
 
     if state == STATE_CHOOSE_EXERCISE:
@@ -1026,6 +1108,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     bool(user["started"]),
                     bool(user["is_admin"]),
                     bool(user["notifications_muted"]),
+                    bool(user["training_active"]),
                 ),
             )
             return
@@ -1070,6 +1153,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if text == BUTTON_LEADERBOARD:
         await show_leaderboard(update, context, limit=20)
+        return
+
+    if text == BUTTON_START_TRAINING:
+        db.set_session(chat_id, STATE_SET_TRAINING_INTERVAL)
+        await update.message.reply_text(
+            "Send training interval in minutes (for example: 30).",
+            reply_markup=main_menu(
+                bool(user["started"]),
+                bool(user["is_admin"]),
+                bool(user["notifications_muted"]),
+                bool(user["training_active"]),
+            ),
+        )
+        return
+
+    if text == BUTTON_STOP_TRAINING:
+        db.stop_training(chat_id)
+        db.set_session(chat_id, STATE_NONE)
+        await send_main_menu(update, db, "Training stopped.")
         return
 
     if text == BUTTON_MUTE_NOTIFICATIONS:
@@ -1124,6 +1226,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 bool(updated_user["started"]),
                 bool(updated_user["is_admin"]),
                 bool(updated_user["notifications_muted"]),
+                bool(updated_user["training_active"]),
             ),
         )
         return
@@ -1134,6 +1237,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             bool(user["started"]),
             bool(user["is_admin"]),
             bool(user["notifications_muted"]),
+            bool(user["training_active"]),
         ),
     )
 
@@ -1162,6 +1266,32 @@ async def reminder_loop(app: Application) -> None:
                     logging.exception("Failed to send reminder to chat_id=%s", chat_id)
                 finally:
                     db.mark_reminder_sent(chat_id, today)
+
+        for row in db.get_training_users():
+            chat_id = int(row["chat_id"])
+            interval_minutes = int(row["training_interval_minutes"] or 0)
+            if interval_minutes <= 0:
+                continue
+
+            last_sent_raw = row["training_last_sent_at"]
+            last_sent = parse_iso_datetime(last_sent_raw) if last_sent_raw else None
+            if last_sent is None:
+                db.update_training_last_sent(chat_id, now.isoformat(timespec="seconds"))
+                continue
+
+            if last_sent.tzinfo is None:
+                last_sent = last_sent.replace(tzinfo=SYDNEY_TZ)
+
+            if now >= last_sent + timedelta(minutes=interval_minutes):
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"Training reminder: time for your next set. Interval: {interval_minutes} minute(s).",
+                    )
+                except Exception:
+                    logging.exception("Failed training reminder to chat_id=%s", chat_id)
+                finally:
+                    db.update_training_last_sent(chat_id, now.isoformat(timespec="seconds"))
 
         await asyncio.sleep(60)
 

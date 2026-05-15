@@ -8,6 +8,7 @@ A lightweight Telegram bot for tracking pushup/pullup challenges with:
 - Main-menu leaderboard (Top 3) with separate Pushup/Pullup sections
 - Compact Top 20 view with separate Pushup/Pullup sections
 - 8:00 PM Sydney reminder when nothing is logged that day
+- Training interval reminders with `Start Training` / `Stop Training`
 - First-time password gate + one-time display name capture
 - Admin support (first authenticated user becomes admin, can kick users)
 
@@ -56,6 +57,7 @@ python bot.py
   - `Minus`
   - `View Progress`
   - `Start` or `End` (dynamic)
+  - `Start Training` or `Stop Training` (dynamic)
   - `Leaderboard` (shows compact top 20 with separate Pushup/Pullup sections)
   - `Admin Panel` (admin only)
 - After `Start`, bot shows config menu:
@@ -69,9 +71,12 @@ python bot.py
 - Reminder logic:
   - Uses `Australia/Sydney`
   - Around 8:00 PM, if no logs exist for that day, sends reminder.
+- Training reminder logic:
+  - Tap `Start Training`, then send interval minutes (for example, `30`)
+  - Bot sends a reminder every X minutes for the next set
+  - Tap `Stop Training` to stop interval reminders
 - Admin panel:
   - `Kick User`
-  - `Global Message` (enter one message and it broadcasts to all users)
   - Admin can kick non-admin users by chat ID
   - Kicked users lose access
 - Admin command:
