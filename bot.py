@@ -6,7 +6,7 @@ import threading
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
@@ -682,6 +682,11 @@ async def send_main_menu(update: Update, db: Database, text: str) -> None:
     )
 
 
+async def refresh_and_send_main_menu(update: Update, db: Database, text: str) -> None:
+    await update.message.reply_text("Refreshing menu...", reply_markup=ReplyKeyboardRemove())
+    await send_main_menu(update, db, text)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: Database = context.application.bot_data["db"]
     chat_id = update.effective_chat.id
@@ -704,7 +709,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     db.set_session(chat_id, STATE_NONE)
 
-    await send_main_menu(
+    await refresh_and_send_main_menu(
         update,
         db,
         "Challenge tracker ready. Use the menu to Add/Minus reps, view progress, or Start/End your challenge.",
@@ -731,7 +736,8 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Please enter your display name first.")
         return
 
-    await send_main_menu(update, db, "Main menu:")
+    db.set_session(chat_id, STATE_NONE)
+    await refresh_and_send_main_menu(update, db, "Main menu:")
 
 
 async def send_admin_message(
