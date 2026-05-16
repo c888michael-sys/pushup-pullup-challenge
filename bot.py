@@ -430,11 +430,14 @@ class Database:
             ).fetchone()
         return int(row["total"])
 
-    def get_daily_totals(self, chat_id: int, limit_days: int = 14) -> list[sqlite3.Row]:
+    def get_daily_breakdown(self, chat_id: int, limit_days: int = 14) -> list[sqlite3.Row]:
         with self.lock:
             rows = self.conn.execute(
                 """
-                SELECT log_date, COALESCE(SUM(pushups + pullups), 0) AS total
+                SELECT
+                    log_date,
+                    COALESCE(SUM(pushups), 0) AS pushups,
+                    COALESCE(SUM(pullups), 0) AS pullups
                 FROM logs
                 WHERE chat_id = ?
                 GROUP BY log_date
@@ -666,18 +669,24 @@ def trend_text(recent: int, previous: int) -> str:
     return f"{direction} ({ratio:.1f}%)"
 
 
-def build_daily_series(daily_rows: list[sqlite3.Row], days: int = 14) -> tuple[list[date], list[int]]:
-    totals_by_date: dict[date, int] = {}
+def build_daily_breakdown_series(
+    daily_rows: list[sqlite3.Row], days: int = 14
+) -> tuple[list[date], list[int], list[int]]:
+    pushups_by_date: dict[date, int] = {}
+    pullups_by_date: dict[date, int] = {}
     for row in daily_rows:
         parsed = parse_iso_date(str(row["log_date"]))
-        if parsed is not None:
-            totals_by_date[parsed] = int(row["total"] or 0)
+        if parsed is None:
+            continue
+        pushups_by_date[parsed] = int(row["pushups"] or 0)
+        pullups_by_date[parsed] = int(row["pullups"] or 0)
 
     end = sydney_today()
     start = end - timedelta(days=days - 1)
     dates = [start + timedelta(days=offset) for offset in range(days)]
-    totals = [totals_by_date.get(day, 0) for day in dates]
-    return dates, totals
+    pushup_totals = [pushups_by_date.get(day, 0) for day in dates]
+    pullup_totals = [pullups_by_date.get(day, 0) for day in dates]
+    return dates, pushup_totals, pullup_totals
 
 
 def calculate_slope(values: list[int]) -> float:
@@ -714,11 +723,12 @@ def render_daily_trend_chart(daily_rows: list[sqlite3.Row]) -> tuple[BytesIO | N
     if not daily_rows:
         return None, 0.0
 
-    dates, totals = build_daily_series(daily_rows)
-    slope = calculate_slope(totals)
-    x_values = list(range(len(totals)))
-    average = sum(totals) / len(totals)
-    center = (len(totals) - 1) / 2
+    dates, pushup_totals, pullup_totals = build_daily_breakdown_series(daily_rows)
+    combined_totals = [p + u for p, u in zip(pushup_totals, pullup_totals)]
+    slope = calculate_slope(combined_totals)
+    x_values = list(range(len(combined_totals)))
+    average = sum(combined_totals) / len(combined_totals)
+    center = (len(combined_totals) - 1) / 2
     fit_values = [slope * (x - center) + average for x in x_values]
 
     width = 960
@@ -735,8 +745,10 @@ def render_daily_trend_chart(daily_rows: list[sqlite3.Row]) -> tuple[BytesIO | N
     grid = (226, 232, 240)
     axis = (148, 163, 184)
     text = (51, 65, 85)
-    bar_fill = (147, 197, 253)
-    bar_edge = (37, 99, 235)
+    pushup_fill = (147, 197, 253)
+    pushup_edge = (37, 99, 235)
+    pullup_fill = (167, 243, 208)
+    pullup_edge = (5, 150, 105)
     line_blue = (29, 78, 216)
     trend_orange = (249, 115, 22)
 
@@ -814,13 +826,20 @@ def render_daily_trend_chart(daily_rows: list[sqlite3.Row]) -> tuple[BytesIO | N
 
     draw_rect(18, 18, width - 18, height - 18, panel)
 
-    max_total = max([*totals, *[max(0, value) for value in fit_values], 5])
+    max_total = max(
+        [
+            *pushup_totals,
+            *pullup_totals,
+            *[max(0, value) for value in fit_values],
+            5,
+        ]
+    )
     y_max = max_total * 1.18
 
     def to_x(index: int) -> int:
-        if len(totals) == 1:
+        if len(combined_totals) == 1:
             return left + plot_width // 2
-        return left + round(index * (plot_width / (len(totals) - 1)))
+        return left + round(index * (plot_width / (len(combined_totals) - 1)))
 
     def to_y(value: float) -> int:
         ratio = max(0.0, min(1.0, value / y_max))
@@ -835,29 +854,45 @@ def render_daily_trend_chart(daily_rows: list[sqlite3.Row]) -> tuple[BytesIO | N
     draw_line(left, top, left, top + plot_height, axis, 2)
     draw_line(left, top + plot_height, width - right, top + plot_height, axis, 2)
 
-    bar_slot = plot_width / len(totals)
-    bar_width = max(18, round(bar_slot * 0.54))
-    for idx, total in enumerate(totals):
-        x = to_x(idx)
-        y = to_y(total)
-        baseline = top + plot_height
-        draw_rect(x - bar_width // 2, y, x + bar_width // 2, baseline, bar_fill)
-        draw_line(x - bar_width // 2, y, x + bar_width // 2, y, bar_edge, 2)
-        draw_line(x - bar_width // 2, y, x - bar_width // 2, baseline, bar_edge, 1)
-        draw_line(x + bar_width // 2, y, x + bar_width // 2, baseline, bar_edge, 1)
-        if total > 0:
-            draw_text(str(total), x - (len(str(total)) * 4), max(top + 2, y - 22), line_blue, 2)
-        if idx % 2 == 0 or idx == len(totals) - 1:
-            draw_text(str(dates[idx].day), x - 6, baseline + 18, text, 2)
+    bar_slot = plot_width / len(combined_totals)
+    bar_width = max(8, round(bar_slot * 0.26))
+    bar_gap = max(2, round(bar_width * 0.18))
+    baseline = top + plot_height
+
+    def draw_bar(x_left: int, y_top: int, fill: tuple[int, int, int], edge: tuple[int, int, int]) -> None:
+        x_right = x_left + bar_width
+        draw_rect(x_left, y_top, x_right, baseline, fill)
+        draw_line(x_left, y_top, x_right, y_top, edge, 2)
+        draw_line(x_left, y_top, x_left, baseline, edge, 1)
+        draw_line(x_right, y_top, x_right, baseline, edge, 1)
+
+    for idx in range(len(combined_totals)):
+        x_center = to_x(idx)
+        pushup_x = x_center - bar_gap // 2 - bar_width
+        pullup_x = x_center + bar_gap // 2
+
+        push_y = to_y(pushup_totals[idx])
+        pull_y = to_y(pullup_totals[idx])
+        draw_bar(pushup_x, push_y, pushup_fill, pushup_edge)
+        draw_bar(pullup_x, pull_y, pullup_fill, pullup_edge)
+
+        if pushup_totals[idx] > 0:
+            label = str(pushup_totals[idx])
+            draw_text(label, pushup_x + bar_width // 2 - len(label) * 4, max(top + 2, push_y - 22), pushup_edge, 2)
+        if pullup_totals[idx] > 0:
+            label = str(pullup_totals[idx])
+            draw_text(label, pullup_x + bar_width // 2 - len(label) * 4, max(top + 2, pull_y - 22), pullup_edge, 2)
+        if idx % 2 == 0 or idx == len(combined_totals) - 1:
+            draw_text(str(dates[idx].day), x_center - 6, baseline + 18, text, 2)
 
     trend_points = [(to_x(idx), to_y(value)) for idx, value in enumerate(fit_values)]
     for (x1, y1), (x2, y2) in zip(trend_points, trend_points[1:]):
         draw_line(x1, y1, x2, y2, trend_orange, 3)
 
-    total_points = [(to_x(idx), to_y(total)) for idx, total in enumerate(totals)]
-    for (x1, y1), (x2, y2) in zip(total_points, total_points[1:]):
+    pushup_points = [(to_x(idx), to_y(total)) for idx, total in enumerate(pushup_totals)]
+    for (x1, y1), (x2, y2) in zip(pushup_points, pushup_points[1:]):
         draw_line(x1, y1, x2, y2, line_blue, 3)
-    for x, y in total_points:
+    for x, y in pushup_points:
         draw_circle(x, y, 6, line_blue)
         draw_circle(x, y, 3, panel)
 
@@ -1067,7 +1102,7 @@ async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     previous_total = db.get_total_in_date_range(chat_id, previous_start, previous_end)
 
     trend = trend_text(recent_total, previous_total)
-    daily_rows = db.get_daily_totals(chat_id, limit_days=14)
+    daily_rows = db.get_daily_breakdown(chat_id, limit_days=14)
     chart_image, slope = render_daily_trend_chart(daily_rows)
 
     goal = int(user["goal"] or 0)
@@ -1097,7 +1132,7 @@ async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if chart_image is not None:
         await update.message.reply_photo(
             photo=chart_image,
-            caption="Progress graph (last 14 days)",
+            caption="Progress graph (last 14 days). Blue = pushups, green = pullups, orange = best-fit on daily total.",
             reply_markup=menu_markup,
         )
     else:
