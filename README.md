@@ -5,11 +5,11 @@ A lightweight Telegram bot for tracking pushup/pullup challenges with:
 - Add/Minus logging (including 0)
 - Challenge start/end + start date/end date/goal settings
 - Progress stats (total, average/day, 7-day trend)
-- Progress graph in `View Progress` (daily totals + best-fit line)
+- Progress graph in `View Progress` — PNG chart of daily totals (last 14 days) with best-fit line
 - Main-menu leaderboard (Top 3) with separate Pushup/Pullup sections
 - Compact Top 20 view with separate Pushup/Pullup sections
 - 8:00 PM Sydney reminder when nothing is logged that day
-- Training interval reminders with `Start Training` / `Stop Training`
+- Training interval reminders with `Begin Training` / `End Training`
 - First-time password gate + one-time display name capture
 - Admin support (first authenticated user becomes admin, can kick users)
 
@@ -58,7 +58,7 @@ python bot.py
   - `Minus`
   - `View Progress`
   - `Start` or `End` (dynamic)
-  - `Start Training` or `Stop Training` (dynamic)
+  - `Begin Training` or `End Training` (dynamic)
   - `Leaderboard` (shows compact top 20 with separate Pushup/Pullup sections)
   - `Admin Panel` (admin only)
 - After `Start`, bot shows config menu:
@@ -73,9 +73,9 @@ python bot.py
   - Uses `Australia/Sydney`
   - Around 8:00 PM, if no logs exist for that day, sends reminder.
 - Training reminder logic:
-  - Tap `Start Training`, then send interval minutes (for example, `30`)
+  - Tap `Begin Training`, then send interval minutes (for example, `30`)
   - Bot sends a reminder every X minutes for the next set
-  - Tap `Stop Training` to stop interval reminders
+  - Tap `End Training` to stop interval reminders
 - Admin panel:
   - `Kick User`
   - Admin can kick non-admin users by chat ID
@@ -120,4 +120,28 @@ sudo systemctl status pushup-bot
 - Date format for challenge dates is `YYYY-MM-DD`.
 - Trend compares recent 7 days to the previous 7 days.
 - If previous 7-day total is 0 and recent is >0, trend shows as increasing/new activity.
-- `View Progress` includes an ASCII daily graph and best-fit slope direction.
+- `View Progress` sends a PNG chart of daily totals (last 14 days) with a best-fit trend line.
+
+## Troubleshooting
+
+### Menu shows stale buttons (e.g., missing `Begin Training` row) or `View Progress` has no graph
+This means an older `python bot.py` process is still running alongside the systemd service and stealing some of the long-poll updates. Telegram delivers each update to exactly one polling consumer, so half the messages hit the new code and half hit the old.
+
+Fix on the VM:
+```bash
+# Find every bot.py process
+ps -ef | grep 'python.*bot.py' | grep -v grep
+
+# Kill any process NOT owned by the systemd service
+sudo kill <PID>           # graceful
+sudo kill -9 <PID>        # if it ignores SIGTERM
+
+# Confirm systemd has the canonical one
+sudo systemctl restart pushup-bot
+sudo systemctl status pushup-bot
+```
+
+Then verify the deployed file is at the latest commit:
+```bash
+cd /path/to/bots && git status && git log -1 --oneline
+```

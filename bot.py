@@ -921,6 +921,18 @@ async def refresh_and_send_main_menu(update: Update, db: Database, text: str) ->
     await send_main_menu(update, db, text)
 
 
+async def send_action_then_main_menu(update: Update, db: Database, action_text: str) -> None:
+    chat_id = update.effective_chat.id
+    user = db.get_user(chat_id)
+    await update.message.reply_text(action_text, reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("Main menu:", reply_markup=main_menu_for_user(user))
+
+
+async def send_submenu_with_refresh(update: Update, prompt_text: str, markup: ReplyKeyboardMarkup) -> None:
+    await update.message.reply_text("Updating menu...", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(prompt_text, reply_markup=markup)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: Database = context.application.bot_data["db"]
     chat_id = update.effective_chat.id
@@ -1080,7 +1092,7 @@ async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
     menu_markup = main_menu_for_user(user)
-    await update.message.reply_text(text, reply_markup=menu_markup)
+    await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
 
     if chart_image is not None:
         await update.message.reply_photo(
@@ -1099,10 +1111,8 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE, l
     push_rows = db.get_leaderboard_by_metric("pushups", limit=limit)
     pull_rows = db.get_leaderboard_by_metric("pullups", limit=limit)
     text = format_side_by_side_leaderboard(push_rows, pull_rows, f"Top {limit}")
-    await update.message.reply_text(
-        text,
-        reply_markup=main_menu_for_user(user),
-    )
+    await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("Main menu:", reply_markup=main_menu_for_user(user))
 
 
 async def process_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE, session: sqlite3.Row) -> None:
@@ -1134,10 +1144,10 @@ async def process_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
     action_word = "Added" if op == "add" else "Subtracted"
     exercise_word = "pushup" if exercise == "pushup" else "pullup"
 
-    user = db.get_user(chat_id)
-    await update.message.reply_text(
+    await send_action_then_main_menu(
+        update,
+        db,
         f"Logged: {action_word} {amount} {exercise_word}(s) for {today_str} (Sydney time).",
-        reply_markup=main_menu_for_user(user),
     )
 
 
@@ -1401,18 +1411,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if text == BUTTON_ADD:
         db.set_session(chat_id, STATE_CHOOSE_EXERCISE, op="add")
-        await update.message.reply_text(
-            "Choose exercise to add.",
-            reply_markup=exercise_menu(),
-        )
+        await send_submenu_with_refresh(update, "Choose exercise to add.", exercise_menu())
         return
 
     if text == BUTTON_MINUS:
         db.set_session(chat_id, STATE_CHOOSE_EXERCISE, op="minus")
-        await update.message.reply_text(
-            "Choose exercise to subtract.",
-            reply_markup=exercise_menu(),
-        )
+        await send_submenu_with_refresh(update, "Choose exercise to subtract.", exercise_menu())
         return
 
     if text == BUTTON_VIEW_PROGRESS:
@@ -1425,9 +1429,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if text in START_TRAINING_BUTTONS:
         db.set_session(chat_id, STATE_SET_TRAINING_INTERVAL)
-        await update.message.reply_text(
+        await send_submenu_with_refresh(
+            update,
             "Send training interval in minutes (for example: 30), or tap Back to cancel.",
-            reply_markup=training_interval_menu(),
+            training_interval_menu(),
         )
         return
 
@@ -1452,15 +1457,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await refresh_and_send_main_menu(update, db, "Admin access only.")
             return
         db.set_session(chat_id, STATE_ADMIN_MENU)
-        await update.message.reply_text("Admin panel:", reply_markup=admin_menu())
+        await send_submenu_with_refresh(update, "Admin panel:", admin_menu())
         return
 
     if text == BUTTON_START:
         if bool(user["started"]):
             db.set_session(chat_id, STATE_CONFIG_MENU)
-            await update.message.reply_text(
+            await send_submenu_with_refresh(
+                update,
                 "Challenge is already started. Update settings below.",
-                reply_markup=config_menu(),
+                config_menu(),
             )
             return
 
@@ -1468,9 +1474,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not user["start_date"]:
             db.update_user_field(chat_id, "start_date", sydney_today().isoformat())
         db.set_session(chat_id, STATE_CONFIG_MENU)
-        await update.message.reply_text(
+        await send_submenu_with_refresh(
+            update,
             "Challenge started. Set or review Start Date, End Date, and Goal.",
-            reply_markup=config_menu(),
+            config_menu(),
         )
         return
 
