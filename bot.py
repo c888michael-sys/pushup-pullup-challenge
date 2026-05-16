@@ -430,8 +430,30 @@ class Database:
             ).fetchone()
         return int(row["total"])
 
-    def get_daily_breakdown(self, chat_id: int, limit_days: int = 14) -> list[sqlite3.Row]:
+    def get_daily_breakdown(
+        self,
+        chat_id: int,
+        since_date: str | None = None,
+        limit_days: int = 14,
+    ) -> list[sqlite3.Row]:
         with self.lock:
+            if since_date is None:
+                rows = self.conn.execute(
+                    """
+                    SELECT
+                        log_date,
+                        COALESCE(SUM(pushups), 0) AS pushups,
+                        COALESCE(SUM(pullups), 0) AS pullups
+                    FROM logs
+                    WHERE chat_id = ?
+                    GROUP BY log_date
+                    ORDER BY log_date DESC
+                    LIMIT ?
+                    """,
+                    (chat_id, limit_days),
+                ).fetchall()
+                return list(reversed(rows))
+
             rows = self.conn.execute(
                 """
                 SELECT
@@ -439,14 +461,13 @@ class Database:
                     COALESCE(SUM(pushups), 0) AS pushups,
                     COALESCE(SUM(pullups), 0) AS pullups
                 FROM logs
-                WHERE chat_id = ?
+                WHERE chat_id = ? AND log_date >= ?
                 GROUP BY log_date
-                ORDER BY log_date DESC
-                LIMIT ?
+                ORDER BY log_date ASC
                 """,
-                (chat_id, limit_days),
+                (chat_id, since_date),
             ).fetchall()
-        return list(reversed(rows))
+        return list(rows)
 
     def has_log_for_day(self, chat_id: int, log_date: str) -> bool:
         with self.lock:
@@ -670,7 +691,9 @@ def trend_text(recent: int, previous: int) -> str:
 
 
 def build_daily_breakdown_series(
-    daily_rows: list[sqlite3.Row], days: int = 14
+    daily_rows: list[sqlite3.Row],
+    days: int = 14,
+    start_date: date | None = None,
 ) -> tuple[list[date], list[int], list[int]]:
     pushups_by_date: dict[date, int] = {}
     pullups_by_date: dict[date, int] = {}
@@ -682,8 +705,12 @@ def build_daily_breakdown_series(
         pullups_by_date[parsed] = int(row["pullups"] or 0)
 
     end = sydney_today()
-    start = end - timedelta(days=days - 1)
-    dates = [start + timedelta(days=offset) for offset in range(days)]
+    if start_date is not None:
+        start = min(start_date, end)
+    else:
+        start = end - timedelta(days=days - 1)
+    span = max(1, (end - start).days + 1)
+    dates = [start + timedelta(days=offset) for offset in range(span)]
     pushup_totals = [pushups_by_date.get(day, 0) for day in dates]
     pullup_totals = [pullups_by_date.get(day, 0) for day in dates]
     return dates, pushup_totals, pullup_totals
@@ -719,11 +746,15 @@ FONT_5X7 = {
 }
 
 
-def render_daily_trend_chart(daily_rows: list[sqlite3.Row]) -> tuple[BytesIO | None, float]:
-    if not daily_rows:
+def render_daily_trend_chart(
+    daily_rows: list[sqlite3.Row], start_date: date | None = None
+) -> tuple[BytesIO | None, float]:
+    if not daily_rows and start_date is None:
         return None, 0.0
 
-    dates, pushup_totals, pullup_totals = build_daily_breakdown_series(daily_rows)
+    dates, pushup_totals, pullup_totals = build_daily_breakdown_series(
+        daily_rows, start_date=start_date
+    )
     combined_totals = [p + u for p, u in zip(pushup_totals, pullup_totals)]
     slope = calculate_slope(combined_totals)
     x_values = list(range(len(combined_totals)))
@@ -854,19 +885,26 @@ def render_daily_trend_chart(daily_rows: list[sqlite3.Row]) -> tuple[BytesIO | N
     draw_line(left, top, left, top + plot_height, axis, 2)
     draw_line(left, top + plot_height, width - right, top + plot_height, axis, 2)
 
-    bar_slot = plot_width / len(combined_totals)
-    bar_width = max(8, round(bar_slot * 0.26))
-    bar_gap = max(2, round(bar_width * 0.18))
+    n = len(combined_totals)
+    bar_slot = plot_width / n
+    bar_width = max(2, min(16, round(bar_slot * 0.30)))
+    bar_gap = max(1, round(bar_width * 0.18))
     baseline = top + plot_height
+
+    show_value_labels = bar_width >= 12
+    show_circles = n <= 30
+    label_stride = max(1, (n + 9) // 10)
 
     def draw_bar(x_left: int, y_top: int, fill: tuple[int, int, int], edge: tuple[int, int, int]) -> None:
         x_right = x_left + bar_width
         draw_rect(x_left, y_top, x_right, baseline, fill)
-        draw_line(x_left, y_top, x_right, y_top, edge, 2)
-        draw_line(x_left, y_top, x_left, baseline, edge, 1)
-        draw_line(x_right, y_top, x_right, baseline, edge, 1)
+        edge_thickness = 2 if bar_width >= 8 else 1
+        draw_line(x_left, y_top, x_right, y_top, edge, edge_thickness)
+        if bar_width >= 4:
+            draw_line(x_left, y_top, x_left, baseline, edge, 1)
+            draw_line(x_right, y_top, x_right, baseline, edge, 1)
 
-    for idx in range(len(combined_totals)):
+    for idx in range(n):
         x_center = to_x(idx)
         pushup_x = x_center - bar_gap // 2 - bar_width
         pullup_x = x_center + bar_gap // 2
@@ -876,13 +914,14 @@ def render_daily_trend_chart(daily_rows: list[sqlite3.Row]) -> tuple[BytesIO | N
         draw_bar(pushup_x, push_y, pushup_fill, pushup_edge)
         draw_bar(pullup_x, pull_y, pullup_fill, pullup_edge)
 
-        if pushup_totals[idx] > 0:
-            label = str(pushup_totals[idx])
-            draw_text(label, pushup_x + bar_width // 2 - len(label) * 4, max(top + 2, push_y - 22), pushup_edge, 2)
-        if pullup_totals[idx] > 0:
-            label = str(pullup_totals[idx])
-            draw_text(label, pullup_x + bar_width // 2 - len(label) * 4, max(top + 2, pull_y - 22), pullup_edge, 2)
-        if idx % 2 == 0 or idx == len(combined_totals) - 1:
+        if show_value_labels:
+            if pushup_totals[idx] > 0:
+                label = str(pushup_totals[idx])
+                draw_text(label, pushup_x + bar_width // 2 - len(label) * 4, max(top + 2, push_y - 22), pushup_edge, 2)
+            if pullup_totals[idx] > 0:
+                label = str(pullup_totals[idx])
+                draw_text(label, pullup_x + bar_width // 2 - len(label) * 4, max(top + 2, pull_y - 22), pullup_edge, 2)
+        if idx % label_stride == 0 or idx == n - 1:
             draw_text(str(dates[idx].day), x_center - 6, baseline + 18, text, 2)
 
     trend_points = [(to_x(idx), to_y(value)) for idx, value in enumerate(fit_values)]
@@ -890,11 +929,13 @@ def render_daily_trend_chart(daily_rows: list[sqlite3.Row]) -> tuple[BytesIO | N
         draw_line(x1, y1, x2, y2, trend_orange, 3)
 
     pushup_points = [(to_x(idx), to_y(total)) for idx, total in enumerate(pushup_totals)]
+    line_thickness = 3 if n <= 30 else 2
     for (x1, y1), (x2, y2) in zip(pushup_points, pushup_points[1:]):
-        draw_line(x1, y1, x2, y2, line_blue, 3)
-    for x, y in pushup_points:
-        draw_circle(x, y, 6, line_blue)
-        draw_circle(x, y, 3, panel)
+        draw_line(x1, y1, x2, y2, line_blue, line_thickness)
+    if show_circles:
+        for x, y in pushup_points:
+            draw_circle(x, y, 6, line_blue)
+            draw_circle(x, y, 3, panel)
 
     image = BytesIO(png_bytes())
     image.name = "progress-chart.png"
@@ -1102,8 +1143,15 @@ async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     previous_total = db.get_total_in_date_range(chat_id, previous_start, previous_end)
 
     trend = trend_text(recent_total, previous_total)
-    daily_rows = db.get_daily_breakdown(chat_id, limit_days=14)
-    chart_image, slope = render_daily_trend_chart(daily_rows)
+    start_date_raw = user["start_date"]
+    chart_start = parse_iso_date(start_date_raw) if start_date_raw else None
+    if chart_start is not None and chart_start > today:
+        chart_start = today
+    if chart_start is not None:
+        daily_rows = db.get_daily_breakdown(chat_id, since_date=chart_start.isoformat())
+    else:
+        daily_rows = db.get_daily_breakdown(chat_id, limit_days=14)
+    chart_image, slope = render_daily_trend_chart(daily_rows, start_date=chart_start)
 
     goal = int(user["goal"] or 0)
     if goal == 0:
@@ -1130,9 +1178,19 @@ async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
 
     if chart_image is not None:
+        if chart_start is not None:
+            chart_caption = (
+                f"Progress graph (from {chart_start.isoformat()} to {today.isoformat()}, Sydney days). "
+                "Blue = pushups, green = pullups, orange = best-fit on daily total."
+            )
+        else:
+            chart_caption = (
+                "Progress graph (last 14 days, Sydney days). "
+                "Blue = pushups, green = pullups, orange = best-fit on daily total."
+            )
         await update.message.reply_photo(
             photo=chart_image,
-            caption="Progress graph (last 14 days). Blue = pushups, green = pullups, orange = best-fit on daily total.",
+            caption=chart_caption,
             reply_markup=menu_markup,
         )
     else:
