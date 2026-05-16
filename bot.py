@@ -2,7 +2,10 @@ import asyncio
 import logging
 import os
 import sqlite3
+import struct
 import threading
+import zlib
+from io import BytesIO
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -21,11 +24,16 @@ BUTTON_MINUS = "Minus"
 BUTTON_VIEW_PROGRESS = "View Progress"
 BUTTON_START = "Start"
 BUTTON_END = "End"
-BUTTON_START_TRAINING = "Start Training"
-BUTTON_STOP_TRAINING = "Stop Training"
+BUTTON_START_TRAINING = "Begin Training"
+BUTTON_STOP_TRAINING = "End Training"
+LEGACY_BUTTON_START_TRAINING = "Start Training"
+LEGACY_BUTTON_STOP_TRAINING = "Stop Training"
+START_TRAINING_BUTTONS = {BUTTON_START_TRAINING, LEGACY_BUTTON_START_TRAINING}
+STOP_TRAINING_BUTTONS = {BUTTON_STOP_TRAINING, LEGACY_BUTTON_STOP_TRAINING}
 BUTTON_LEADERBOARD = "Leaderboard"
 BUTTON_ADMIN_PANEL = "Admin Panel"
 BUTTON_KICK_USER = "Kick User"
+BUTTON_GLOBAL_MESSAGE = "Global Message"
 BUTTON_MUTE_NOTIFICATIONS = "Mute Notifications"
 BUTTON_UNMUTE_NOTIFICATIONS = "Unmute Notifications"
 
@@ -49,6 +57,7 @@ STATE_WAIT_PASSWORD = "wait_password"
 STATE_WAIT_NAME = "wait_name"
 STATE_ADMIN_MENU = "admin_menu"
 STATE_ADMIN_KICK_USER = "admin_kick_user"
+STATE_ADMIN_GLOBAL_MESSAGE = "admin_global_message"
 STATE_SET_TRAINING_INTERVAL = "set_training_interval"
 
 
@@ -584,9 +593,17 @@ def config_menu() -> ReplyKeyboardMarkup:
     )
 
 
+def training_interval_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[BUTTON_BACK]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 def admin_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[BUTTON_KICK_USER], [BUTTON_BACK]],
+        [[BUTTON_KICK_USER], [BUTTON_GLOBAL_MESSAGE], [BUTTON_BACK]],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -649,54 +666,205 @@ def trend_text(recent: int, previous: int) -> str:
     return f"{direction} ({ratio:.1f}%)"
 
 
-def build_daily_trend_graph(daily_rows: list[sqlite3.Row]) -> tuple[str, float]:
-    if not daily_rows:
-        return "Daily trend graph: no workout logs yet.", 0.0
+def build_daily_series(daily_rows: list[sqlite3.Row], days: int = 14) -> tuple[list[date], list[int]]:
+    totals_by_date: dict[date, int] = {}
+    for row in daily_rows:
+        parsed = parse_iso_date(str(row["log_date"]))
+        if parsed is not None:
+            totals_by_date[parsed] = int(row["total"] or 0)
 
-    if len(daily_rows) == 1:
-        only = daily_rows[0]
-        return f"Daily trend graph: need at least 2 days.\n{only['log_date']}: {int(only['total'])}", 0.0
+    end = sydney_today()
+    start = end - timedelta(days=days - 1)
+    dates = [start + timedelta(days=offset) for offset in range(days)]
+    totals = [totals_by_date.get(day, 0) for day in dates]
+    return dates, totals
 
-    y_values = [float(int(r["total"])) for r in daily_rows]
-    n = len(y_values)
-    x_values = [float(i) for i in range(n)]
 
-    x_mean = sum(x_values) / n
-    y_mean = sum(y_values) / n
+def calculate_slope(values: list[int]) -> float:
+    if len(values) < 2:
+        return 0.0
+
+    x_values = [float(i) for i in range(len(values))]
+    y_values = [float(value) for value in values]
+    x_mean = sum(x_values) / len(x_values)
+    y_mean = sum(y_values) / len(y_values)
     denom = sum((x - x_mean) ** 2 for x in x_values)
-    slope = (sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, y_values)) / denom) if denom else 0.0
-    intercept = y_mean - slope * x_mean
-    fit_values = [slope * x + intercept for x in x_values]
+    if not denom:
+        return 0.0
+    return sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, y_values)) / denom
 
-    y_min = min(min(y_values), min(fit_values), 0.0)
-    y_max = max(max(y_values), max(fit_values), 1.0)
-    if abs(y_max - y_min) < 1e-9:
-        y_max += 1.0
 
-    height = 8
-    width = n
-    grid = [[" " for _ in range(width)] for _ in range(height)]
+FONT_5X7 = {
+    "0": ["111", "101", "101", "101", "101", "101", "111"],
+    "1": ["010", "110", "010", "010", "010", "010", "111"],
+    "2": ["111", "001", "001", "111", "100", "100", "111"],
+    "3": ["111", "001", "001", "111", "001", "001", "111"],
+    "4": ["101", "101", "101", "111", "001", "001", "001"],
+    "5": ["111", "100", "100", "111", "001", "001", "111"],
+    "6": ["111", "100", "100", "111", "101", "101", "111"],
+    "7": ["111", "001", "001", "010", "010", "010", "010"],
+    "8": ["111", "101", "101", "111", "101", "101", "111"],
+    "9": ["111", "101", "101", "111", "001", "001", "111"],
+    "-": ["000", "000", "000", "111", "000", "000", "000"],
+    " ": ["000", "000", "000", "000", "000", "000", "000"],
+}
 
-    def to_row(v: float) -> int:
-        ratio = (v - y_min) / (y_max - y_min)
-        row = height - 1 - int(round(ratio * (height - 1)))
-        return max(0, min(height - 1, row))
 
-    for i, fv in enumerate(fit_values):
-        r = to_row(fv)
-        grid[r][i] = "-"
+def render_daily_trend_chart(daily_rows: list[sqlite3.Row]) -> tuple[BytesIO | None, float]:
+    if not daily_rows:
+        return None, 0.0
 
-    for i, yv in enumerate(y_values):
-        r = to_row(yv)
-        grid[r][i] = "x" if grid[r][i] == "-" else "*"
+    dates, totals = build_daily_series(daily_rows)
+    slope = calculate_slope(totals)
+    x_values = list(range(len(totals)))
+    average = sum(totals) / len(totals)
+    center = (len(totals) - 1) / 2
+    fit_values = [slope * (x - center) + average for x in x_values]
 
-    lines = ["Daily trend graph (latest days)", "Legend: * daily total, - best-fit, x overlap"]
-    for ridx, row in enumerate(grid):
-        y_label = y_max - (y_max - y_min) * (ridx / (height - 1))
-        lines.append(f"{int(round(y_label)):>4}|{''.join(row)}")
-    lines.append("    +" + "-" * width)
-    lines.append(f"     {daily_rows[0]['log_date']} -> {daily_rows[-1]['log_date']}")
-    return "\n".join(lines), slope
+    width = 960
+    height = 560
+    left = 78
+    right = 34
+    top = 42
+    bottom = 76
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+
+    background = (248, 250, 252)
+    panel = (255, 255, 255)
+    grid = (226, 232, 240)
+    axis = (148, 163, 184)
+    text = (51, 65, 85)
+    bar_fill = (147, 197, 253)
+    bar_edge = (37, 99, 235)
+    line_blue = (29, 78, 216)
+    trend_orange = (249, 115, 22)
+
+    pixels = [[background for _ in range(width)] for _ in range(height)]
+
+    def set_pixel(x: int, y: int, color: tuple[int, int, int]) -> None:
+        if 0 <= x < width and 0 <= y < height:
+            pixels[y][x] = color
+
+    def draw_rect(x1: int, y1: int, x2: int, y2: int, color: tuple[int, int, int]) -> None:
+        x1, x2 = sorted((max(0, x1), min(width - 1, x2)))
+        y1, y2 = sorted((max(0, y1), min(height - 1, y2)))
+        for y in range(y1, y2 + 1):
+            row = pixels[y]
+            for x in range(x1, x2 + 1):
+                row[x] = color
+
+    def draw_line(x1: int, y1: int, x2: int, y2: int, color: tuple[int, int, int], thickness: int = 1) -> None:
+        dx = abs(x2 - x1)
+        dy = -abs(y2 - y1)
+        sx = 1 if x1 < x2 else -1
+        sy = 1 if y1 < y2 else -1
+        err = dx + dy
+        x, y = x1, y1
+        radius = max(0, thickness // 2)
+        while True:
+            draw_rect(x - radius, y - radius, x + radius, y + radius, color)
+            if x == x2 and y == y2:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x += sx
+            if e2 <= dx:
+                err += dx
+                y += sy
+
+    def draw_circle(cx: int, cy: int, radius: int, color: tuple[int, int, int]) -> None:
+        for y in range(cy - radius, cy + radius + 1):
+            for x in range(cx - radius, cx + radius + 1):
+                if (x - cx) ** 2 + (y - cy) ** 2 <= radius ** 2:
+                    set_pixel(x, y, color)
+
+    def draw_text(raw: str, x: int, y: int, color: tuple[int, int, int], scale: int = 2) -> None:
+        cursor = x
+        for char in raw:
+            glyph = FONT_5X7.get(char, FONT_5X7[" "])
+            for gy, row in enumerate(glyph):
+                for gx, bit in enumerate(row):
+                    if bit == "1":
+                        draw_rect(
+                            cursor + gx * scale,
+                            y + gy * scale,
+                            cursor + (gx + 1) * scale - 1,
+                            y + (gy + 1) * scale - 1,
+                            color,
+                        )
+            cursor += (len(glyph[0]) + 1) * scale
+
+    def png_bytes() -> bytes:
+        raw_rows = []
+        for row in pixels:
+            raw_rows.append(b"\x00" + b"".join(bytes(color) for color in row))
+        raw = b"".join(raw_rows)
+
+        def chunk(kind: bytes, data: bytes) -> bytes:
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b"")
+        )
+
+    draw_rect(18, 18, width - 18, height - 18, panel)
+
+    max_total = max([*totals, *[max(0, value) for value in fit_values], 5])
+    y_max = max_total * 1.18
+
+    def to_x(index: int) -> int:
+        if len(totals) == 1:
+            return left + plot_width // 2
+        return left + round(index * (plot_width / (len(totals) - 1)))
+
+    def to_y(value: float) -> int:
+        ratio = max(0.0, min(1.0, value / y_max))
+        return top + plot_height - round(ratio * plot_height)
+
+    for step in range(6):
+        value = round((y_max / 5) * step)
+        y = to_y(value)
+        draw_line(left, y, width - right, y, grid, 1)
+        draw_text(str(value), 24, y - 8, text, 2)
+
+    draw_line(left, top, left, top + plot_height, axis, 2)
+    draw_line(left, top + plot_height, width - right, top + plot_height, axis, 2)
+
+    bar_slot = plot_width / len(totals)
+    bar_width = max(18, round(bar_slot * 0.54))
+    for idx, total in enumerate(totals):
+        x = to_x(idx)
+        y = to_y(total)
+        baseline = top + plot_height
+        draw_rect(x - bar_width // 2, y, x + bar_width // 2, baseline, bar_fill)
+        draw_line(x - bar_width // 2, y, x + bar_width // 2, y, bar_edge, 2)
+        draw_line(x - bar_width // 2, y, x - bar_width // 2, baseline, bar_edge, 1)
+        draw_line(x + bar_width // 2, y, x + bar_width // 2, baseline, bar_edge, 1)
+        if total > 0:
+            draw_text(str(total), x - (len(str(total)) * 4), max(top + 2, y - 22), line_blue, 2)
+        if idx % 2 == 0 or idx == len(totals) - 1:
+            draw_text(str(dates[idx].day), x - 6, baseline + 18, text, 2)
+
+    trend_points = [(to_x(idx), to_y(value)) for idx, value in enumerate(fit_values)]
+    for (x1, y1), (x2, y2) in zip(trend_points, trend_points[1:]):
+        draw_line(x1, y1, x2, y2, trend_orange, 3)
+
+    total_points = [(to_x(idx), to_y(total)) for idx, total in enumerate(totals)]
+    for (x1, y1), (x2, y2) in zip(total_points, total_points[1:]):
+        draw_line(x1, y1, x2, y2, line_blue, 3)
+    for x, y in total_points:
+        draw_circle(x, y, 6, line_blue)
+        draw_circle(x, y, 3, panel)
+
+    image = BytesIO(png_bytes())
+    image.name = "progress-chart.png"
+    image.seek(0)
+    return image, slope
 
 
 def compute_average(total: int, user_row: sqlite3.Row) -> str:
@@ -723,6 +891,15 @@ def compute_average(total: int, user_row: sqlite3.Row) -> str:
     return f"{avg:.2f} per day over {days} day(s)"
 
 
+def main_menu_for_user(user: sqlite3.Row) -> ReplyKeyboardMarkup:
+    return main_menu(
+        bool(user["started"]),
+        bool(user["is_admin"]),
+        bool(user["notifications_muted"]),
+        bool(user["training_active"]),
+    )
+
+
 async def send_main_menu(update: Update, db: Database, text: str) -> None:
     chat_id = update.effective_chat.id
     user = db.get_user(chat_id)
@@ -736,19 +913,11 @@ async def send_main_menu(update: Update, db: Database, text: str) -> None:
     else:
         training_status = "Off"
     menu_text = f"{board}\n\nMain Menu\nReminders: {reminder_status}\nTraining: {training_status}\n{text}"
-    await update.message.reply_text(
-        menu_text,
-        reply_markup=main_menu(
-            bool(user["started"]),
-            bool(user["is_admin"]),
-            bool(user["notifications_muted"]),
-            bool(user["training_active"]),
-        ),
-    )
+    await update.message.reply_text(menu_text, reply_markup=main_menu_for_user(user))
 
 
 async def refresh_and_send_main_menu(update: Update, db: Database, text: str) -> None:
-    await update.message.reply_text("Refreshing menu...", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("Updating menu...", reply_markup=ReplyKeyboardRemove())
     await send_main_menu(update, db, text)
 
 
@@ -887,7 +1056,7 @@ async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     trend = trend_text(recent_total, previous_total)
     daily_rows = db.get_daily_totals(chat_id, limit_days=14)
-    graph_text, slope = build_daily_trend_graph(daily_rows)
+    chart_image, slope = render_daily_trend_chart(daily_rows)
 
     goal = int(user["goal"] or 0)
     if goal == 0:
@@ -907,19 +1076,20 @@ async def show_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Trend (7d vs prev 7d): {trend}\n"
         f"Best-fit line slope: {slope:.2f} ({slope_label})\n"
         f"Recent 7d / Previous 7d: {recent_total} / {previous_total}\n"
-        f"{goal_line}\n\n"
-        f"{graph_text}"
+        f"{goal_line}"
     )
 
-    await update.message.reply_text(
-        text,
-        reply_markup=main_menu(
-            bool(user["started"]),
-            bool(user["is_admin"]),
-            bool(user["notifications_muted"]),
-            bool(user["training_active"]),
-        ),
-    )
+    menu_markup = main_menu_for_user(user)
+    await update.message.reply_text(text, reply_markup=menu_markup)
+
+    if chart_image is not None:
+        await update.message.reply_photo(
+            photo=chart_image,
+            caption="Progress graph (last 14 days)",
+            reply_markup=menu_markup,
+        )
+    else:
+        await update.message.reply_text("Progress graph: no workout logs yet.", reply_markup=menu_markup)
 
 
 async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE, limit: int = 20) -> None:
@@ -931,12 +1101,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE, l
     text = format_side_by_side_leaderboard(push_rows, pull_rows, f"Top {limit}")
     await update.message.reply_text(
         text,
-        reply_markup=main_menu(
-            bool(user["started"]),
-            bool(user["is_admin"]),
-            bool(user["notifications_muted"]),
-            bool(user["training_active"]),
-        ),
+        reply_markup=main_menu_for_user(user),
     )
 
 
@@ -972,12 +1137,7 @@ async def process_amount_input(update: Update, context: ContextTypes.DEFAULT_TYP
     user = db.get_user(chat_id)
     await update.message.reply_text(
         f"Logged: {action_word} {amount} {exercise_word}(s) for {today_str} (Sydney time).",
-        reply_markup=main_menu(
-            bool(user["started"]),
-            bool(user["is_admin"]),
-            bool(user["notifications_muted"]),
-            bool(user["training_active"]),
-        ),
+        reply_markup=main_menu_for_user(user),
     )
 
 
@@ -1078,13 +1238,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         db.set_session(chat_id, STATE_NONE)
         updated_user = db.get_user(chat_id)
         extra = " You are the admin." if bool(updated_user["is_admin"]) else ""
-        await send_main_menu(update, db, f"Name saved as {display_name}.{extra}")
+        await refresh_and_send_main_menu(update, db, f"Name saved as {display_name}.{extra}")
+        return
+
+    if state in {STATE_ADMIN_MENU, STATE_ADMIN_KICK_USER, STATE_ADMIN_GLOBAL_MESSAGE} and not bool(user["is_admin"]):
+        db.set_session(chat_id, STATE_NONE)
+        await refresh_and_send_main_menu(update, db, "Admin access only.")
         return
 
     if state == STATE_ADMIN_KICK_USER:
         if text == BUTTON_BACK:
-            db.set_session(chat_id, STATE_NONE)
-            await send_main_menu(update, db, "Admin action cancelled.")
+            db.set_session(chat_id, STATE_ADMIN_MENU)
+            await update.message.reply_text("Admin action cancelled.", reply_markup=admin_menu())
             return
         try:
             target_chat_id = int(text)
@@ -1110,10 +1275,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"Kicked: {kicked_name} ({target_chat_id})", reply_markup=admin_menu())
         return
 
+    if state == STATE_ADMIN_GLOBAL_MESSAGE:
+        if text == BUTTON_BACK:
+            db.set_session(chat_id, STATE_ADMIN_MENU)
+            await update.message.reply_text("Global message cancelled.", reply_markup=admin_menu())
+            return
+
+        if not text:
+            await update.message.reply_text("Global message cannot be empty. Send a message, or tap Back.", reply_markup=admin_menu())
+            return
+
+        result = await send_admin_message(context.application, db, "all", text)
+        db.set_session(chat_id, STATE_ADMIN_MENU)
+        await update.message.reply_text(result, reply_markup=admin_menu())
+        return
+
     if state == STATE_ADMIN_MENU:
         if text == BUTTON_BACK:
             db.set_session(chat_id, STATE_NONE)
-            await send_main_menu(update, db, "Back to main menu.")
+            await refresh_and_send_main_menu(update, db, "Back to main menu.")
             return
         if text == BUTTON_KICK_USER:
             top20 = db.get_overall_leaderboard(limit=20)
@@ -1127,7 +1307,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=admin_menu(),
             )
             return
-        await update.message.reply_text("Choose Kick User or Back.", reply_markup=admin_menu())
+        if text == BUTTON_GLOBAL_MESSAGE:
+            db.set_session(chat_id, STATE_ADMIN_GLOBAL_MESSAGE)
+            await update.message.reply_text(
+                "Send the message to broadcast to all active users, or tap Back.",
+                reply_markup=admin_menu(),
+            )
+            return
+        await update.message.reply_text("Choose Kick User, Global Message, or Back.", reply_markup=admin_menu())
         return
 
     if state == STATE_ENTER_AMOUNT:
@@ -1145,28 +1332,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if state == STATE_SET_TRAINING_INTERVAL:
         if text == BUTTON_BACK:
             db.set_session(chat_id, STATE_NONE)
-            await send_main_menu(update, db, "Training setup cancelled.")
+            await refresh_and_send_main_menu(update, db, "Training setup cancelled.")
             return
 
         try:
             interval_minutes = int(text)
         except ValueError:
-            await update.message.reply_text("Send interval in whole minutes (for example: 30).")
+            await update.message.reply_text(
+                "Send interval in whole minutes (for example: 30).",
+                reply_markup=training_interval_menu(),
+            )
             return
 
         if interval_minutes <= 0:
-            await update.message.reply_text("Interval must be at least 1 minute.")
+            await update.message.reply_text(
+                "Interval must be at least 1 minute.",
+                reply_markup=training_interval_menu(),
+            )
             return
 
         db.start_training(chat_id, interval_minutes)
         db.set_session(chat_id, STATE_NONE)
-        await send_main_menu(update, db, f"Training started. You will get reminders every {interval_minutes} minute(s).")
+        await refresh_and_send_main_menu(update, db, f"Training started. You will get reminders every {interval_minutes} minute(s).")
         return
 
     if state == STATE_CHOOSE_EXERCISE:
         if text == BUTTON_BACK:
             db.set_session(chat_id, STATE_NONE)
-            await send_main_menu(update, db, "Cancelled.")
+            await refresh_and_send_main_menu(update, db, "Cancelled.")
             return
 
         if text not in {BUTTON_PUSHUP, BUTTON_PULLUP}:
@@ -1185,16 +1378,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if state == STATE_CONFIG_MENU:
         if text == BUTTON_DONE:
             db.set_session(chat_id, STATE_NONE)
-            user = db.get_user(chat_id)
-            await update.message.reply_text(
-                "Challenge settings saved.",
-                reply_markup=main_menu(
-                    bool(user["started"]),
-                    bool(user["is_admin"]),
-                    bool(user["notifications_muted"]),
-                    bool(user["training_active"]),
-                ),
-            )
+            await refresh_and_send_main_menu(update, db, "Challenge settings saved.")
             return
 
         if text == BUTTON_START_DATE:
@@ -1239,38 +1423,33 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await show_leaderboard(update, context, limit=20)
         return
 
-    if text == BUTTON_START_TRAINING:
+    if text in START_TRAINING_BUTTONS:
         db.set_session(chat_id, STATE_SET_TRAINING_INTERVAL)
         await update.message.reply_text(
-            "Send training interval in minutes (for example: 30).",
-            reply_markup=main_menu(
-                bool(user["started"]),
-                bool(user["is_admin"]),
-                bool(user["notifications_muted"]),
-                bool(user["training_active"]),
-            ),
+            "Send training interval in minutes (for example: 30), or tap Back to cancel.",
+            reply_markup=training_interval_menu(),
         )
         return
 
-    if text == BUTTON_STOP_TRAINING:
+    if text in STOP_TRAINING_BUTTONS:
         db.stop_training(chat_id)
         db.set_session(chat_id, STATE_NONE)
-        await send_main_menu(update, db, "Training stopped.")
+        await refresh_and_send_main_menu(update, db, "Training stopped.")
         return
 
     if text == BUTTON_MUTE_NOTIFICATIONS:
         db.set_notifications_muted(chat_id, True)
-        await send_main_menu(update, db, "Notifications muted. 8 PM reminders are now off.")
+        await refresh_and_send_main_menu(update, db, "Notifications muted. 8 PM reminders are now off.")
         return
 
     if text == BUTTON_UNMUTE_NOTIFICATIONS:
         db.set_notifications_muted(chat_id, False)
-        await send_main_menu(update, db, "Notifications unmuted. 8 PM reminders are now on.")
+        await refresh_and_send_main_menu(update, db, "Notifications unmuted. 8 PM reminders are now on.")
         return
 
     if text == BUTTON_ADMIN_PANEL:
         if not bool(user["is_admin"]):
-            await send_main_menu(update, db, "Admin access only.")
+            await refresh_and_send_main_menu(update, db, "Admin access only.")
             return
         db.set_session(chat_id, STATE_ADMIN_MENU)
         await update.message.reply_text("Admin panel:", reply_markup=admin_menu())
@@ -1297,32 +1476,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if text == BUTTON_END:
         if not bool(user["started"]):
-            await send_main_menu(update, db, "Challenge is not currently started.")
+            await refresh_and_send_main_menu(update, db, "Challenge is not currently started.")
             return
 
         db.set_started(chat_id, False)
         db.update_user_field(chat_id, "end_date", sydney_today().isoformat())
         db.set_session(chat_id, STATE_NONE)
-        updated_user = db.get_user(chat_id)
-        await update.message.reply_text(
-            f"Challenge ended on {sydney_today().isoformat()} (Sydney time).",
-            reply_markup=main_menu(
-                bool(updated_user["started"]),
-                bool(updated_user["is_admin"]),
-                bool(updated_user["notifications_muted"]),
-                bool(updated_user["training_active"]),
-            ),
-        )
+        await refresh_and_send_main_menu(update, db, f"Challenge ended on {sydney_today().isoformat()} (Sydney time).")
         return
 
     await update.message.reply_text(
         "Use the menu buttons below. You can also use /menu.",
-        reply_markup=main_menu(
-            bool(user["started"]),
-            bool(user["is_admin"]),
-            bool(user["notifications_muted"]),
-            bool(user["training_active"]),
-        ),
+        reply_markup=main_menu_for_user(user),
     )
 
 
