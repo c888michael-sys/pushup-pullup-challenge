@@ -1,12 +1,17 @@
 import asyncio
+import json
 import logging
 import os
 import sqlite3
 import struct
+import sys
 import threading
+import urllib.error
+import urllib.request
 import zlib
 from io import BytesIO
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
@@ -288,6 +293,13 @@ class Database:
                 "SELECT 1 FROM usersdb.users WHERE is_admin = 1 AND is_kicked = 0 LIMIT 1"
             ).fetchone()
         return row is not None
+
+    def get_admin_chat_ids(self) -> list[int]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT chat_id FROM usersdb.users WHERE is_admin = 1 AND is_kicked = 0"
+            ).fetchall()
+        return [int(r["chat_id"]) for r in rows]
 
     def set_admin(self, chat_id: int, is_admin: bool) -> None:
         now = sydney_now().isoformat(timespec="seconds")
@@ -1677,6 +1689,75 @@ def build_app() -> Application:
     return app
 
 
+DUPLICATE_ALERT_STATE = Path(__file__).with_name(".duplicate_alert_count")
+DUPLICATE_ALERT_MAX = 3
+
+
+def _telegram_call(token: str, method: str, payload: dict | None = None, timeout: float = 15) -> dict:
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = json.dumps(payload or {}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            return {"ok": False, "error_code": exc.code, "description": str(exc)}
+
+
+def check_for_duplicate_poller(token: str, admin_ids: list[int]) -> None:
+    me = _telegram_call(token, "getMe", timeout=10)
+    if not me.get("ok"):
+        logging.error("getMe failed during startup probe: %s", me)
+        return
+
+    username = me["result"]["username"]
+    logging.warning("Bot @%s starting as PID %d (pushup bot)", username, os.getpid())
+
+    probe = _telegram_call(token, "getUpdates", {"timeout": 0, "limit": 1}, timeout=15)
+    if probe.get("error_code") != 409:
+        try:
+            DUPLICATE_ALERT_STATE.unlink()
+        except FileNotFoundError:
+            pass
+        return
+
+    try:
+        count = int(DUPLICATE_ALERT_STATE.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        count = 0
+
+    if count < DUPLICATE_ALERT_MAX and admin_ids:
+        host = os.uname().nodename if hasattr(os, "uname") else "unknown"
+        text = (
+            f"pushup bot: another instance is polling.\n"
+            f"Host: {host}\n"
+            f"PID refusing to start: {os.getpid()}\n"
+            f"Alert {count + 1}/{DUPLICATE_ALERT_MAX} — will go silent after this.\n"
+            f"Fix: ssh in, find the duplicate (ps -ef | grep 'pushup-pullup'), "
+            f"check /proc/<pid>/cgroup, kill the one not under pushup-bot.service."
+        )
+        for admin_id in admin_ids:
+            send_result = _telegram_call(
+                token, "sendMessage", {"chat_id": admin_id, "text": text}, timeout=10
+            )
+            if not send_result.get("ok"):
+                logging.warning("Failed to send duplicate-alert to %s: %s", admin_id, send_result)
+        try:
+            DUPLICATE_ALERT_STATE.write_text(str(count + 1))
+        except Exception as exc:
+            logging.warning("Failed to write alert state: %s", exc)
+
+    logging.error(
+        "409 Conflict on startup probe — another instance is polling. Refusing to start (alert %d/%d).",
+        min(count + 1, DUPLICATE_ALERT_MAX),
+        DUPLICATE_ALERT_MAX,
+    )
+    sys.exit(1)
+
+
 def main() -> None:
     raw_level = os.getenv(LOG_LEVEL_ENV, "WARNING").upper()
     level = getattr(logging, raw_level, logging.WARNING)
@@ -1686,6 +1767,21 @@ def main() -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    token = os.getenv(TOKEN_ENV)
+    if not token:
+        raise RuntimeError(f"Missing {TOKEN_ENV} environment variable")
+
+    # Best-effort admin lookup before starting; safe to fail (DB may not exist yet on first run).
+    admin_ids: list[int] = []
+    try:
+        probe_db = Database(DB_PATH, USER_DB_PATH)
+        admin_ids = probe_db.get_admin_chat_ids()
+        probe_db.conn.close()
+    except Exception as exc:
+        logging.warning("Could not pre-load admin IDs for duplicate-alert: %s", exc)
+
+    check_for_duplicate_poller(token, admin_ids)
 
     application = build_app()
     application.run_polling()
