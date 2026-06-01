@@ -107,6 +107,16 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_logs_chat_date ON logs(chat_id, log_date);
 
+                CREATE TABLE IF NOT EXISTS daily_logs (
+                    chat_id INTEGER NOT NULL,
+                    log_date TEXT NOT NULL,
+                    pushups INTEGER NOT NULL DEFAULT 0,
+                    pullups INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, log_date)
+                );
+
                 CREATE TABLE IF NOT EXISTS sessions (
                     chat_id INTEGER PRIMARY KEY,
                     state TEXT NOT NULL DEFAULT '',
@@ -413,18 +423,29 @@ class Database:
         with self.lock:
             self.conn.execute(
                 """
-                INSERT INTO logs(chat_id, log_date, pushups, pullups, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO daily_logs(chat_id, log_date, pushups, pullups, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, log_date) DO UPDATE SET
+                    pushups = daily_logs.pushups + excluded.pushups,
+                    pullups = daily_logs.pullups + excluded.pullups,
+                    updated_at = excluded.updated_at
                 """,
-                (chat_id, log_date, pushups, pullups, now),
+                (chat_id, log_date, pushups, pullups, now, now),
             )
             self.conn.commit()
 
     def get_totals(self, chat_id: int) -> tuple[int, int, int]:
         with self.lock:
             row = self.conn.execute(
-                "SELECT COALESCE(SUM(pushups), 0) AS p, COALESCE(SUM(pullups), 0) AS u FROM logs WHERE chat_id = ?",
-                (chat_id,),
+                """
+                SELECT COALESCE(SUM(pushups), 0) AS p, COALESCE(SUM(pullups), 0) AS u
+                FROM (
+                    SELECT pushups, pullups FROM logs WHERE chat_id = ?
+                    UNION ALL
+                    SELECT pushups, pullups FROM daily_logs WHERE chat_id = ?
+                )
+                """,
+                (chat_id, chat_id),
             ).fetchone()
         pushups = int(row["p"])
         pullups = int(row["u"])
@@ -435,10 +456,17 @@ class Database:
             row = self.conn.execute(
                 """
                 SELECT COALESCE(SUM(pushups + pullups), 0) AS total
-                FROM logs
-                WHERE chat_id = ? AND log_date >= ? AND log_date <= ?
+                FROM (
+                    SELECT pushups, pullups
+                    FROM logs
+                    WHERE chat_id = ? AND log_date >= ? AND log_date <= ?
+                    UNION ALL
+                    SELECT pushups, pullups
+                    FROM daily_logs
+                    WHERE chat_id = ? AND log_date >= ? AND log_date <= ?
+                )
                 """,
-                (chat_id, start_date, end_date),
+                (chat_id, start_date, end_date, chat_id, start_date, end_date),
             ).fetchone()
         return int(row["total"])
 
@@ -456,13 +484,20 @@ class Database:
                         log_date,
                         COALESCE(SUM(pushups), 0) AS pushups,
                         COALESCE(SUM(pullups), 0) AS pullups
-                    FROM logs
-                    WHERE chat_id = ?
+                    FROM (
+                        SELECT log_date, pushups, pullups
+                        FROM logs
+                        WHERE chat_id = ?
+                        UNION ALL
+                        SELECT log_date, pushups, pullups
+                        FROM daily_logs
+                        WHERE chat_id = ?
+                    )
                     GROUP BY log_date
                     ORDER BY log_date DESC
                     LIMIT ?
                     """,
-                    (chat_id, limit_days),
+                    (chat_id, chat_id, limit_days),
                 ).fetchall()
                 return list(reversed(rows))
 
@@ -472,20 +507,35 @@ class Database:
                     log_date,
                     COALESCE(SUM(pushups), 0) AS pushups,
                     COALESCE(SUM(pullups), 0) AS pullups
-                FROM logs
-                WHERE chat_id = ? AND log_date >= ?
+                FROM (
+                    SELECT log_date, pushups, pullups
+                    FROM logs
+                    WHERE chat_id = ? AND log_date >= ?
+                    UNION ALL
+                    SELECT log_date, pushups, pullups
+                    FROM daily_logs
+                    WHERE chat_id = ? AND log_date >= ?
+                )
                 GROUP BY log_date
                 ORDER BY log_date ASC
                 """,
-                (chat_id, since_date),
+                (chat_id, since_date, chat_id, since_date),
             ).fetchall()
         return list(rows)
 
     def has_log_for_day(self, chat_id: int, log_date: str) -> bool:
         with self.lock:
             row = self.conn.execute(
-                "SELECT 1 FROM logs WHERE chat_id = ? AND log_date = ? LIMIT 1",
-                (chat_id, log_date),
+                """
+                SELECT 1
+                FROM (
+                    SELECT 1 FROM logs WHERE chat_id = ? AND log_date = ?
+                    UNION ALL
+                    SELECT 1 FROM daily_logs WHERE chat_id = ? AND log_date = ?
+                )
+                LIMIT 1
+                """,
+                (chat_id, log_date, chat_id, log_date),
             ).fetchone()
         return row is not None
 
@@ -505,9 +555,9 @@ class Database:
 
     def get_leaderboard_by_metric(self, metric: str, limit: int = 20) -> list[sqlite3.Row]:
         if metric == "pushups":
-            sum_expr = "COALESCE(SUM(l.pushups), 0)"
+            total_column = "pushups"
         elif metric == "pullups":
-            sum_expr = "COALESCE(SUM(l.pullups), 0)"
+            total_column = "pullups"
         else:
             raise ValueError("metric must be pushups or pullups")
 
@@ -517,9 +567,20 @@ class Database:
                 SELECT
                     u.chat_id,
                     u.display_name,
-                    {sum_expr} AS total
+                    COALESCE(a.{total_column}, 0) AS total
                 FROM usersdb.users u
-                LEFT JOIN main.logs l ON l.chat_id = u.chat_id
+                LEFT JOIN (
+                    SELECT
+                        chat_id,
+                        COALESCE(SUM(pushups), 0) AS pushups,
+                        COALESCE(SUM(pullups), 0) AS pullups
+                    FROM (
+                        SELECT chat_id, pushups, pullups FROM main.logs
+                        UNION ALL
+                        SELECT chat_id, pushups, pullups FROM main.daily_logs
+                    )
+                    GROUP BY chat_id
+                ) a ON a.chat_id = u.chat_id
                 WHERE u.authenticated = 1 AND u.is_kicked = 0
                 GROUP BY u.chat_id, u.display_name
                 ORDER BY total DESC, u.chat_id ASC
@@ -536,9 +597,17 @@ class Database:
                 SELECT
                     u.chat_id,
                     u.display_name,
-                    COALESCE(SUM(l.pushups + l.pullups), 0) AS total
+                    COALESCE(a.total, 0) AS total
                 FROM usersdb.users u
-                LEFT JOIN main.logs l ON l.chat_id = u.chat_id
+                LEFT JOIN (
+                    SELECT chat_id, COALESCE(SUM(pushups + pullups), 0) AS total
+                    FROM (
+                        SELECT chat_id, pushups, pullups FROM main.logs
+                        UNION ALL
+                        SELECT chat_id, pushups, pullups FROM main.daily_logs
+                    )
+                    GROUP BY chat_id
+                ) a ON a.chat_id = u.chat_id
                 WHERE u.authenticated = 1 AND u.is_kicked = 0
                 GROUP BY u.chat_id, u.display_name
                 ORDER BY total DESC, u.chat_id ASC

@@ -19,7 +19,7 @@ This bot uses Python + SQLite (`sqlite3`) for a small footprint and simple deplo
 ## Files
 - `bot.py` - main bot app
 - `requirements.txt` - dependencies
-- `pushup_pullup_bot.db` - workout/activity DB (logs, sessions, reminder history)
+- `pushup_pullup_bot.db` - workout/activity DB (`logs`, `daily_logs`, sessions, reminder history)
 - `user_data.db` - user profile DB (auth, names, admin, kick/mute state)
 
 ## Setup
@@ -69,6 +69,8 @@ python bot.py
 - `Add`/`Minus` flow:
   - Choose `Pushup` or `Pullup`
   - Enter whole number (`0` allowed)
+  - New entries are stored in `daily_logs` as one row per user/date.
+  - Existing event-level `logs` rows are left untouched and remain included in all progress and leaderboard totals.
 - Reminder logic:
   - Uses `Australia/Sydney`
   - Around 8:00 PM, if no logs exist for that day, sends reminder.
@@ -145,3 +147,27 @@ Then verify the deployed file is at the latest commit:
 ```bash
 cd /path/to/bots && git status && git log -1 --oneline
 ```
+
+## Storage Notes
+New workout entries use this table:
+
+```sql
+CREATE TABLE IF NOT EXISTS daily_logs (
+    chat_id INTEGER NOT NULL,
+    log_date TEXT NOT NULL,
+    pushups INTEGER NOT NULL DEFAULT 0,
+    pullups INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, log_date)
+);
+```
+
+The older `logs` table is retained as historical event-level data. Read queries combine both tables with `UNION ALL`, then aggregate totals by user/date/metric as needed. This means deployment only needs the normal code update and bot restart; no manual SQLite commands are required.
+
+Future old-data optimisation plan:
+
+1. Add an admin-only maintenance command that previews how many old `logs` rows would compact into daily totals.
+2. Write compacted historical totals into a separate archive table, leaving `logs` unchanged during preview and first rollout.
+3. Run verification queries comparing totals, date ranges, leaderboards, and reminder checks before and after enabling the archive reads.
+4. Only after a backup and successful verification, consider a separate optional cleanup command for old event rows. That cleanup is intentionally not part of the current rollout.
